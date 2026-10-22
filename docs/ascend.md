@@ -62,6 +62,38 @@ over `n_action_steps`; on Ascend that prefix forward has no fused kernel equival
 vanilla decoding pays it 10× per chunk. Same policy, same hardware → the algorithmic gain is
 larger, which is the interesting NPU-side result.
 
+## LIBERO evaluation
+
+Run with `--policy.device=npu --policy.n_action_steps=10 --env.max_parallel_tasks=1
+--eval.batch_size=1 --inference_overlap_steps=0 --seed=1000`.
+
+| Suite | Episodes | pc_success | avg_time_per_action_step | notes |
+|---|---|---|---|---|
+| libero_object | 10 tasks × 10 ep | **99.0 %** | 351.1 ms | 100 episodes, 56.3 s/episode, 160.3 steps/episode |
+
+Partial results are written after every completed task to
+`<output_dir>/eval_info.partial.json` (atomically) and `eval_info.partial.jsonl`, so a
+crashed run keeps the tasks it already finished. The final `eval_info.json` still contains
+`per_task`, `per_group`, `overall` and now also a `progress` block.
+
+Operational pitfalls (all verified on 192.168.45.9):
+
+* **Do not kill "duplicate" eval processes.** Each eval has 3 extra children with the same
+  cmdline; they are the CANN TBE kernel-cache `SyncManager` daemons
+  (`tbe/common/repository_manager/utils/multiprocess_util.py:48`). They inherit the cmdline
+  and log fd but never write logs. Killing them breaks op-compile cache lookups.
+* **EGL is scarce.** Each eval process creates 10 MuJoCo offscreen contexts; running 4 evals
+  (40 contexts) makes a new one die instantly with
+  `OpenGL.raw.EGL._errors.EGLError: <exception str() failed>`. Keep ≤3 concurrent evals, or
+  launch them staggered.
+* **`HF_HUB_OFFLINE=1` + LIBERO assets.** `libero/libero/__init__.py:get_assets_path()`
+  falls back to a *nonexistent* path when the HF download raises, and MuJoCo may then
+  segfault. We keep `HF_HUB_OFFLINE=1` (the tokenizer cache alias needs it) and make the
+  lookup deterministic with a symlink:
+  `ln -s /root/.cache/libero/assets <site-packages>/libero/libero/assets`.
+* `AsyncStreamingActionManager` is constructed per episode; that is cheap and only matters
+  if you enable `--policy.compile_model=true` (graph capture per episode would be costly).
+
 Notes / non-goals:
 
 * `config.json` sets `"dtype": "bfloat16"` and `__init__` calls

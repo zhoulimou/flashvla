@@ -589,6 +589,7 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             only_record_failures=os.environ.get("EVAL_RECORD_ALL", "0") in ("0", "false", "False"),
+            output_dir=Path(cfg.output_dir),
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -722,6 +723,7 @@ def eval_policy_all(
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
     only_record_failures: bool = False,
+    output_dir: Path | None = None,
 ) -> dict:
     start_t = time.time()
 
@@ -768,11 +770,41 @@ def eval_policy_all(
         only_record_failures=only_record_failures,
     )
 
+    def _dump_partial(tg: str, tid: int, metrics: dict) -> None:
+        """Persist per-task progress so a crash does not lose finished tasks.
+
+        ``eval_info.json`` is only written after *every* task finished; a crash or
+        SIGKILL late in a multi-hour eval would otherwise discard all episodes.
+        """
+        if output_dir is None:
+            return
+        try:
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            succ = [x for info in per_task_infos for x in info["metrics"].get("successes", [])]
+            payload = {
+                "partial": True,
+                "last_task": {"task_group": tg, "task_id": tid},
+                "tasks_done": len(per_task_infos),
+                "tasks_total": len(tasks),
+                "n_episodes": len(succ),
+                "pc_success_so_far": (100.0 * sum(succ) / len(succ)) if succ else None,
+                "per_task": list(per_task_infos),
+            }
+            tmp = out / "eval_info.partial.json.tmp"
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(out / "eval_info.partial.json")
+            with open(out / "eval_info.partial.jsonl", "a") as fh:
+                fh.write(json.dumps({"task_group": tg, "task_id": tid, "metrics": metrics}) + "\n")
+        except Exception as exc:  # noqa: BLE001 - never let bookkeeping kill the eval
+            print(f"Warning: failed to write partial eval results: {exc}")
+
     if max_parallel_tasks <= 1:
         for task_group, task_id, env in tasks:
             tg, tid, metrics = task_runner(task_group, task_id, env)
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+            _dump_partial(tg, tid, metrics)
     else:
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
             fut2meta = {}
@@ -783,6 +815,7 @@ def eval_policy_all(
                 tg, tid, metrics = fut.result()
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                _dump_partial(tg, tid, metrics)
 
     def _agg_from_list(xs):
         if not xs:
