@@ -24,7 +24,14 @@ export BENCH_VANILLA_ITERS="${BENCH_VANILLA_ITERS:-5}"
 export BENCH_TAG="${BENCH_TAG:-bench}"
 LOG_DIR="${LOG_DIR:-/home/data/flashvla/logs}"
 
-export ASCEND_RT_VISIBLE_DEVICES="$CARD"
+# Honour an explicitly exported ASCEND_RT_VISIBLE_DEVICES (useful for ad-hoc runs);
+# CARD is only a fallback so the documented CARD=N form keeps working.
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$CARD}"
+
+# The flashvla-npu conda env is not on PATH in a non-interactive ssh shell;
+# the system python3 has no torch_npu/numpy. Pin the interpreter explicitly.
+PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/flashvla-npu/bin/python}"
+export PATH="/root/miniconda3/envs/flashvla-npu/bin:$PATH"
 POLICY_PATH="${POLICY_PATH:-/home/data/flashvla/weights/flashvla-pi05-libero}"
 
 # Ascend runtime: the toolkit's set_env.sh dereferences LD_LIBRARY_PATH before
@@ -39,22 +46,32 @@ fi
 # Never block on a huggingface.co HEAD request for a model that is already local.
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
-# MuJoCo/EGL: the README's NVIDIA EGL vendor json does not exist on Ascend.
+# MuJoCo/EGL: only MUJOCO_GL is needed. EGL_PLATFORM / LIBGL_ALWAYS_SOFTWARE
+# must stay unset -- setting either one segfaults (or fails to build) robosuite's
+# offscreen EGL context inside make_env on this box. Verified against the
+# working configuration from the 2026-10-22 14:47 baseline run.
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export EGL_PLATFORM="${EGL_PLATFORM:-surfaceless}"
-export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export TOKENIZERS_PARALLELISM=false
+unset EGL_PLATFORM LIBGL_ALWAYS_SOFTWARE
 
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/${BENCH_TAG}_c${CARD}.log"
 echo "[run_bench] card=$CARD chunks=$BENCH_CHUNKS warmup=$BENCH_WARMUP steps=$BENCH_STEPS"
 echo "[run_bench] overlap=$BENCH_OVERLAP vanilla=$BENCH_VANILLA tag=$BENCH_TAG log=$LOG"
 
-python -u bench_npu.py \
+"$PYTHON_BIN" -u bench_npu.py \
   --policy.path="$POLICY_PATH" \
   --policy.device=npu \
   --policy.compile_model=false \
   --policy.fuse_qkv=false \
   --policy.fuse_gate_up=false \
+  --env.type=libero \
+  --env.task="${ENV_TASK:-libero_spatial}" \
+  --env.max_parallel_tasks=1 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=1 \
   2>&1 | tee "$LOG"
 
 exit "${PIPESTATUS[0]}"

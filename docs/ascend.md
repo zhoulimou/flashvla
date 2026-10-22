@@ -31,6 +31,19 @@ so `--policy.device=npu` fails before any model code runs.
   `refs/main` must be written **without a trailing newline**, otherwise
   `huggingface_hub.try_to_load_from_cache()` never matches.
 
+* **MuJoCo/EGL: leave `EGL_PLATFORM` and `LIBGL_ALWAYS_SOFTWARE` unset.** Only
+  `MUJOCO_GL=egl` is required. Setting `EGL_PLATFORM=surfaceless` or
+  `LIBGL_ALWAYS_SOFTWARE=1` makes the second and later `make_env()` call either segfault
+  (`exit 139`, no Python traceback) or abort with
+  `OpenGL.raw.EGL._errors.EGLError: <exception str() failed>` — the first env often builds
+  fine, so the failure looks like a model problem. Both wrappers now `unset` them
+  explicitly. `LIBGL_ALWAYS_SOFTWARE=1` (LLVMpipe) was a leftover from the initial
+  `Cannot initialize a EGL device display` fix; installing `mesa-dri-drivers` for swrast
+  was the actual fix, and forcing software rendering on top of it is what broke.
+* `OMP_NUM_THREADS` / `MKL_NUM_THREADS`: pin to 8 for benchmarks. On a 256-core host the
+  small batch-1 CPU preprocessing pays an OpenMP sync tax that shows up as run-to-run
+  noise; 8 matches the low-core behaviour the latency doc quotes.
+
 ## Run
 
 ```bash

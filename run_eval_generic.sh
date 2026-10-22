@@ -24,7 +24,14 @@ OVERLAP_STEPS="${OVERLAP_STEPS:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/data/flashvla/logs}"
 POLICY_PATH="${POLICY_PATH:-/home/data/flashvla/weights/flashvla-pi05-libero}"
 
-export ASCEND_RT_VISIBLE_DEVICES="$CARD"
+# Honour an explicitly exported ASCEND_RT_VISIBLE_DEVICES (useful for ad-hoc runs);
+# CARD is only a fallback so the documented CARD=N form keeps working.
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$CARD}"
+
+# The flashvla-npu conda env is not on PATH in a non-interactive ssh shell;
+# the system python3 has no torch_npu/numpy. Pin the interpreter explicitly.
+PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/flashvla-npu/bin/python}"
+export PATH="/root/miniconda3/envs/flashvla-npu/bin:$PATH"
 
 if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
   set +u
@@ -34,9 +41,11 @@ if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
 fi
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+# Only MUJOCO_GL is needed. EGL_PLATFORM / LIBGL_ALWAYS_SOFTWARE must stay
+# unset -- setting either one segfaults robosuite's offscreen EGL context in
+# make_env on this box (verified against the 2026-10-22 known-good run).
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export EGL_PLATFORM="${EGL_PLATFORM:-surfaceless}"
-export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+unset EGL_PLATFORM LIBGL_ALWAYS_SOFTWARE
 
 # Small-tensor CPU preprocessing pays an OpenMP sync tax on many-core hosts;
 # pinning the thread count reproduces the low-core latency quoted in the doc.
@@ -51,7 +60,7 @@ echo "[run_eval] suite=$SUITE chip=$CARD eps=$EPS seeds=$SEEDS tag=$TAG"
 echo "[run_eval] out=$OUT log=$LOG"
 echo "[run_eval] note: at most 3 concurrent evals — EGL contexts are limited"
 
-python -u sim_eval/libero/eval.py \
+"$PYTHON_BIN" -u sim_eval/libero/eval.py \
   --policy.path="$POLICY_PATH" \
   --policy.device=npu \
   --policy.compile_model=false \
@@ -70,7 +79,7 @@ python -u sim_eval/libero/eval.py \
 
 rc="${PIPESTATUS[0]}"
 if [ -f "$OUT/eval_info.json" ]; then
-  python3 - "$OUT/eval_info.json" "$CARD" "$SUITE" <<'PY'
+  "$PYTHON_BIN" - "$OUT/eval_info.json" "$CARD" "$SUITE" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))["overall"]
 print(f"  [chip={sys.argv[2]}] suite={sys.argv[3]}  pc_success={d.get('pc_success'):.1f}")
