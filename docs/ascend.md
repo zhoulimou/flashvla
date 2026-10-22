@@ -44,23 +44,26 @@ python sim_eval/libero/eval.py \
   --output_dir=/home/data/flashvla/logs/eval_spatial_out
 ```
 
-## Measured (single 910B3, checkpoint dtype bf16, n_action_steps=10, `bench_npu.py`)
+## Measured (single 910B3, `bench_npu.py`)
+
+Full baseline report: [`docs/ascend_baseline.md`](ascend_baseline.md). Native code path
+(appliance-level device plumbing only), `n_action_steps=10`, batch 1, sync decoding, 40 chunks
+per run on three different chips:
 
 | Metric | Value |
 |---|---|
-| FlashVLA chunk latency | **131.5 ms** (p50 131.3, p95 135.9), 40 chunks |
-| FlashVLA **Time/Step** | **13.15 ms** |
-| stage breakdown | encode 39.0 + prefill 44.1 + denoise 52.2 ms → **61% is observation-prefix recompute** |
-| vanilla π0.5 10-step decode | 1271.4 ms/chunk → 127.1 ms/step |
-| **same-device speedup** | **9.67×** (paper reports 2.62× on GPU) |
-| async manager step (no env) | 13.00 / 12.70 / 12.67 / 12.46 ms for overlap 0/1/2/3 |
+| FlashVLA chunk latency | **124.3 / 134.4 / 129.8 ms** (median 123.9 / 134.2 / 129.1) |
+| FlashVLA **Time/Step** | **12.43 / 13.44 / 12.98 ms** |
+| stage breakdown | encode ~35-38 + prefill ~40-45 + denoise ~47-52 ms -> **56-62 % is observation-prefix work** |
+| vanilla pi0.5, prefix cached once per chunk | 559 / 599 / 550 ms per chunk -> **55.9 / 59.9 / 55.0 ms per step** |
+| vanilla pi0.5, prefix recomputed per denoise step | 1246 / 1323 / 1238 ms -> 124.6 / 132.3 / 123.8 ms per step |
+| **same-device speedup (honest)** | **4.50 / 4.45 / 4.24x** (pessimistic variant: 10.02 / 9.85 / 9.54x) |
 | peak HBM | 8424 MB |
-| LIBERO eval, spatial 10 tasks × 1 ep | 10/10 success, 630.7 ms/step wall-clock (MuJoCo env dominates) |
 
-Why the speedup is larger than on GPU: FlashVLA amortizes the observation-prefix forward
-over `n_action_steps`; on Ascend that prefix forward has no fused kernel equivalent, so
-vanilla decoding pays it 10× per chunk. Same policy, same hardware → the algorithmic gain is
-larger, which is the interesting NPU-side result.
+Official CUDA numbers for reference (README, RTX 4090, 2 views, `benchmarks/benchmark_latency.py`):
+pi0.5 45.8 ms/chunk, FlashVLA 26.7 ms/chunk -> 1.72x. So the FlashVLA algorithmic win is
+**larger on Ascend (4.2-4.5x) than on a 4090 (1.72x)**, because one denoise step is relatively
+more expensive here (no fused kernels), while the absolute latency is ~4.9x the 4090.
 
 ## LIBERO evaluation
 
@@ -74,13 +77,14 @@ Run with `--policy.device=npu --policy.n_action_steps=10 --env.max_parallel_task
 | libero_spatial | **96.0 %** (96/100) | 132.2 | 82.4 | 622.9 | 2 h 35 m |
 | libero_object | **99.0 %** (99/100) | 160.3 | 56.3 | 351.1 | 1 h 46 m |
 | libero_goal | **99.0 %** (99/100) | 133.3 | 68.7 | 515.4 | 2 h 10 m |
-| libero_10 | running (10 tasks × 10 ep) | – | ~120 | ~600 | ~3.5 h expected |
+| libero_10 | **96.0 %** (96/100) | 274.7 | 102.0 | 371.5 | 3 h 03 m |
 
 Wall time per environment step is dominated by MuJoCo offscreen rendering on CPU
 (llvmpipe) and observation preprocessing — the policy accounts for only ~13 ms of the
 ~600 ms per step. That is why the LIBERO numbers here cannot be compared to the paper's
 `Time/Step` metric directly: the paper measures policy time, this table measures whole-loop
 wall time. Paper reference: π0.5 96.9 average, FlashVLA 97.9–98.3 average on LIBERO.
+Our four-suite average (10 episodes per task): **97.5**.
 
 ### Async chunk overlap (`--inference_overlap_steps`, `sweep_overlap.py`)
 

@@ -540,17 +540,19 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
 
     logging.info("Making policy.")
 
-    # Every weight is overwritten by the checkpoint load, so skip the random
-    # initialisation of the freshly constructed model: on pi0.5 (3B) that init costs
-    # minutes of CPU time on the Ascend hosts. See flashvla/startup.py.
+    # Native (upstream) build path by default: the Ascend port must not change behaviour.
+    # Skipping the discarded random initialisation is a pure start-up win -- verified to
+    # produce bit-identical weights, see docs/ascend.md -- but it is opt-in
+    # (FLASHVLA_FAST_STARTUP=1) so the baseline stays "code as shipped, plus NPU support".
     _t_build = time.time()
-    with no_random_init():
+    _fast_startup = os.environ.get("FLASHVLA_FAST_STARTUP", "0") == "1"
+    with no_random_init() if _fast_startup else nullcontext():
         policy = make_policy(
             cfg=cfg.policy,
             env_cfg=cfg.env,
             rename_map=cfg.rename_map,
         )
-    logging.info(f"Policy built in {time.time() - _t_build:.1f}s")
+    logging.info(f"Policy built in {time.time() - _t_build:.1f}s (fast_startup={_fast_startup})")
 
     policy.eval()
 

@@ -45,6 +45,8 @@ eval.py keep working):
     BENCH_STEPS=120    manager steps per overlap setting
     BENCH_OVERLAP=0,1,2,3
     BENCH_VANILLA=1    run phase 3 (vanilla 10-step decode); 0 to skip
+                       3a = prefix cached once per chunk (the honest baseline),
+                       3b = prefix recomputed every denoise step
     BENCH_DENOISE_STEPS=10  denoise steps of the vanilla sampler
     BENCH_ENV_MS=0     simulated env-step cost (ms) per step in phase 4
     BENCH_TAG=bench    output json stem
@@ -74,6 +76,7 @@ from lerobot.utils.utils import init_logging
 import flashvla.npu_support  # noqa: F401  (patches lerobot device whitelist for npu)
 from flashvla.async_manager import AsyncStreamingActionManager
 from flashvla.policies.factory import make_policy, make_pre_post_processors
+from flashvla.startup import no_random_init
 from flashvla.policies.pi0.utils import build_attention_mask_and_position_ids
 
 
@@ -266,6 +269,65 @@ def measure_phases(policy, batch, device, n: int) -> dict:
 
 
 
+def measure_vanilla_cached(
+    policy, batch: dict, device: torch.device, n: int, denoise_steps: int
+) -> dict:
+    """Vanilla pi0.5 decoding with the prefix computed *once* per chunk.
+
+    This is how the original flow-matching sampler runs: ``prefix_embedder`` + prefill
+    once, then ``denoise_steps`` KV-cached ``denoise_step`` calls.  It is the honest
+    baseline for "how much does FlashVLA save", because FlashVLA also pays the prefix
+    exactly once per chunk and only replaces the 10 denoise steps with 1.
+    """
+    model = policy.model
+    images, img_masks = policy.prepare_images(batch)
+    state = policy.prepare_state(batch)
+    tokens = batch[OBS_LANGUAGE_TOKENS]
+    masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+    C = model.C
+    bsz = tokens.shape[0]
+    dev = tokens.device
+    action_dim = model.config.max_action_dim
+    dt = 1.0 / denoise_steps
+    chunks: list[float] = []
+
+    with torch.inference_mode():
+        for _ in range(n):
+            x = model.sample_noise((bsz, C, action_dim), dev)
+            ctx = _amp_ctx()
+            ctx.__enter__()
+            start = perf_counter() * 1000.0
+            prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
+                images, img_masks, tokens, masks
+            )
+            for layer in model.layers:
+                layer.self_attn.attn.reset_cache()
+            prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
+                prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
+            )
+            hidden = [prefix_embs, None]
+            conds = [None, None]
+            for layer in model.layers:
+                hidden = layer(hidden, prefix_attention_mask, prefix_position_ids, conds, use_cache=True)
+            for step in range(denoise_steps):
+                t = torch.full((bsz, C), step * dt, device=dev, dtype=torch.float32)
+                v_t = model.denoise_step(
+                    prefix_pad_masks, prefix_att_masks, state, x, t, padding_mask=None
+                )
+                x = x - dt * v_t
+            ctx.__exit__(None, None, None)
+            _sync(device)
+            chunks.append(perf_counter() * 1000.0 - start)
+
+    stats = _stats(chunks)
+    n_action_steps = policy.config.n_action_steps
+    stats["denoise_steps"] = int(denoise_steps)
+    stats["n_action_steps"] = int(n_action_steps)
+    stats["prefix_computed_per_chunk"] = 1
+    stats["time_per_action_step_ms"] = stats["mean_ms"] / n_action_steps
+    return stats
+
+
 def measure_vanilla(policy, batch: dict, device: torch.device, n: int, denoise_steps: int) -> dict:
     """Vanilla pi0.5 decoding: ``denoise_steps`` full forwards per chunk.
 
@@ -376,7 +438,11 @@ def bench_main(cfg: BenchConfig):
 
     envs, obs = build_obs(cfg)
     print("[bench] observation ready, loading policy (this can take minutes)...")
-    policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env, rename_map=cfg.rename_map)
+    # Optional start-up shortcut (does not change the measured regions or the weights):
+    # skipping the discarded random init turns a 320 s build into ~3 s.
+    _fast_startup = os.environ.get("FLASHVLA_FAST_STARTUP", "0") == "1"
+    with no_random_init() if _fast_startup else contextlib.nullcontext():
+        policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env, rename_map=cfg.rename_map)
     policy.eval()
     preprocessor, _ = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -431,11 +497,24 @@ def bench_main(cfg: BenchConfig):
     results["phases"] = first["phases"]
 
     if env_ms is not None and run_vanilla:
-        print("[bench] phase 3: vanilla 10-step decode baseline")
-        results["vanilla"] = measure_vanilla(
-            policy, batch, device, int(os.environ.get("BENCH_VANILLA_ITERS", "5")), denoise_steps
+        vanilla_iters = int(os.environ.get("BENCH_VANILLA_ITERS", "5"))
+        print("[bench] phase 3a: vanilla 10-step decode, prefix cached once per chunk")
+        results["vanilla"] = measure_vanilla_cached(
+            policy, batch, device, vanilla_iters, denoise_steps
         )
         print(json.dumps(results["vanilla"], indent=2))
+        print("[bench] phase 3b: vanilla with prefix recomputed on every denoise step")
+        results["vanilla_recompute"] = measure_vanilla(
+            policy, batch, device, vanilla_iters, denoise_steps
+        )
+        print(json.dumps(results["vanilla_recompute"], indent=2))
+        if results["policy_only"].get("time_per_action_step_ms"):
+            sp_cached = results["vanilla"]["time_per_action_step_ms"] / results["policy_only"]["time_per_action_step_ms"]
+            sp_recomp = results["vanilla_recompute"]["time_per_action_step_ms"] / results["policy_only"]["time_per_action_step_ms"]
+            results["speedup_vs_vanilla_cached"] = round(sp_cached, 2)
+            results["speedup_vs_vanilla_recompute"] = round(sp_recomp, 2)
+            print(f"[bench] FlashVLA vs vanilla (cached prefix):   {sp_cached:.2f}x")
+            print(f"[bench] FlashVLA vs vanilla (recomputed prefix): {sp_recomp:.2f}x")
 
     print("[bench] phase 4: async overlap manager step latency")
     results["manager"] = {}
