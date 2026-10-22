@@ -62,6 +62,7 @@ from flashvla.async_manager import AsyncStreamingActionManager
 # Ascend NPU: register the "npu" backend with lerobot's device helpers so
 # `--policy.device=npu` parses instead of raising mid-parse (no-op off NPU).
 import flashvla.npu_support  # noqa: E402,F401
+from flashvla.startup import no_random_init  # noqa: E402
 
 
 @dataclass
@@ -539,11 +540,17 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
 
     logging.info("Making policy.")
 
-    policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-        rename_map=cfg.rename_map,
-    )
+    # Every weight is overwritten by the checkpoint load, so skip the random
+    # initialisation of the freshly constructed model: on pi0.5 (3B) that init costs
+    # minutes of CPU time on the Ascend hosts. See flashvla/startup.py.
+    _t_build = time.time()
+    with no_random_init():
+        policy = make_policy(
+            cfg=cfg.policy,
+            env_cfg=cfg.env,
+            rename_map=cfg.rename_map,
+        )
+    logging.info(f"Policy built in {time.time() - _t_build:.1f}s")
 
     policy.eval()
 

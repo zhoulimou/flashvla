@@ -129,6 +129,10 @@ Operational pitfalls (all verified on 192.168.45.9):
   `ln -s /root/.cache/libero/assets <site-packages>/libero/libero/assets`.
 * `AsyncStreamingActionManager` is constructed per episode; that is cheap and only matters
   if you enable `--policy.compile_model=true` (graph capture per episode would be costly).
+* **Never launch the same eval twice.** A second `eval.py` with the same `--output_dir` does
+  not replace the first one: both keep running, they share `libero10.log` and
+  `eval_info.partial.json`, and the interleaved progress bars make the run look like it is
+  restarting. `pgrep -af "sim_eval/libero/eval.py"` before launching, and kill duplicates.
 
 Notes / non-goals:
 
@@ -137,8 +141,33 @@ Notes / non-goals:
   are `patch_embedding`/`position_embedding`/layernorms by design). Do not wrap inference in
   `torch.autocast("npu")` — it was measured **1.9× slower** (256.0 vs 134.2 ms/chunk) because
   every op re-casts fp32 inputs.
-* Load time is ~7 min: LeRobot builds fp32 params on CPU (random init) before loading the
-  safetensors; not addressed yet.
+
+## Fast policy construction (`flashvla/startup.py`)
+
+`PreTrainedPolicy.from_pretrained` builds the policy from its config — randomly initialising
+all 3B weights on CPU — and only then loads the safetensors checkpoint. That discarded
+initialisation dominated start-up. `flashvla.startup.no_random_init()` wraps transformers'
+`no_init_weights()` (which patches `torch.nn.init.*` and `PreTrainedModel.init_weights` to
+no-ops) around `make_policy`:
+
+| path | build time |
+|---|---|
+| default (`from_pretrained` as-is) | **320.5 s** |
+| `with no_random_init():` | **2.8 s** (114.7× faster) |
+
+Verified with `sim_eval/libero/bench_startup.py` on the same weights: all 813 parameters are
+present in the checkpoint, and 8 spot-checked tensors match the safetensors bit-for-bit
+(`max_abs_diff = 0.0`). Peak HBM is unchanged (8308 MB).
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=6 python sim_eval/libero/bench_startup.py \
+    --policy.path=/home/data/flashvla/weights/flashvla-pi05-libero \
+    --policy.device=npu --env.type=libero \
+    --output_dir=/home/data/flashvla/logs/startup_out
+```
+
+`sim_eval/libero/eval.py` already wraps its `make_policy` call and logs `Policy built in Xs`.
+`bench_npu.py` does not need it (its construction cost is outside the timed regions).
 
 ## Reproduce the numbers
 
