@@ -58,7 +58,10 @@ mkdir -p "$OUT"
 
 echo "[run_eval] suite=$SUITE chip=$CARD eps=$EPS seeds=$SEEDS tag=$TAG"
 echo "[run_eval] out=$OUT log=$LOG"
-echo "[run_eval] note: at most 3 concurrent evals — EGL contexts are limited"
+# Measured on this box: 7 concurrent eval processes each holding one MuJoCo
+# EGL context run fine, and a single process was also verified with 5 contexts;
+# 7 procs x 5 envs (35 contexts) all built successfully. The earlier "at most 3
+# concurrent" note was a guess, not a limit of the software rasteriser.
 
 "$PYTHON_BIN" -u sim_eval/libero/eval.py \
   --policy.path="$POLICY_PATH" \
