@@ -99,9 +99,15 @@ Wall time per environment step is dominated by MuJoCo offscreen rendering on CPU
 wall time. Paper reference: π0.5 96.9 average, FlashVLA 97.9–98.3 average on LIBERO.
 Our four-suite average (10 episodes per task): **97.5**.
 
-### Async chunk overlap (`--inference_overlap_steps`, `sweep_overlap.py`)
+### Async chunk overlap (`--inference_overlap_steps`)
 
-Task `libero_spatial/0`, 5 episodes per setting, same seed, policy loaded once:
+Two different things are called "overlap" in this repo and they must not be compared
+across the two tables below.
+
+#### Accuracy: whole-loop rollouts (`sweep_overlap.py`)
+
+Task `libero_spatial/0`, 5 episodes per setting, same seed, policy loaded once. The
+manager is built with `skip_stale_actions=False`, so no RTC realignment is in play:
 
 | overlap_steps | pc_success | s/episode | ms/action step |
 |---|---|---|---|
@@ -110,19 +116,47 @@ Task `libero_spatial/0`, 5 episodes per setting, same seed, policy loaded once:
 | 2 | 100 % | 72.2 | 647.9 |
 | 3 (no RTC realignment) | **40 %** | 123.2 | 573.0 |
 
-Two findings:
+Without `skip_stale_actions` the manager replays actions computed `overlap_steps`
+observations earlier, and at overlap=3 success collapses to 2/5. This is why the
+evaluation table above uses sync decoding.
 
-1. **Overlap buys nothing on this box.** Policy time is ~13 ms/action step while the
-   environment loop costs ~600 ms/action step, so there is at most a ~2 % headroom to hide;
-   the manager's own bookkeeping eats it. Upstream's async mode assumes CUDA-graph compiled
-   dispatch (`eval.sh` forces `COMPILE_MODEL=true` when `OVERLAP_STEPS>0`).
+#### Latency: policy-only, simulated env step (`bench_npu.py`)
+
+`measure_manager()` builds `AsyncStreamingActionManager(..., skip_stale_actions=False)`
+and charges a synthetic per-step env cost `BENCH_ENV_MS`. 40 chunks, 120 timed steps,
+4 chips in parallel, `ENV_MS=0` vs `ENV_MS=600`:
+
+| ENV_MS | overlap 0 | overlap 1 | overlap 2 | overlap 3 |
+|---|---|---|---|---|
+| 0    | 12.72 ms | 12.95 ms | 12.96 ms | 12.95 ms |
+| 0    | 12.02 ms | 11.96 ms | 12.10 ms | 12.12 ms |
+| 600  | 613.96 ms | 613.06 ms | 612.58 ms | 612.49 ms |
+| 600  | 612.04 ms | 612.09 ms | 612.13 ms | 612.11 ms |
+
+At `ENV_MS=600` the stall is only 12.1–13.1 ms of a ~612 ms step, i.e. the policy is
+2 % of the loop and overlap can hide at most that much: measured gain from overlap 0→3 is
+1.5 ms (0.24 %), within run-to-run noise. At `ENV_MS=0` there is nothing to overlap with,
+so overlap is flat-to-slightly-negative (12.72 → 12.95 ms).
+
+Three findings:
+
+1. **Overlap buys nothing on this box.** The environment loop costs ~600 ms/action step
+   while the policy costs ~13 ms, so there is at most ~2 % of headroom to hide and the
+   manager's own bookkeeping eats it. Upstream's async mode also assumes CUDA-graph
+   compiled dispatch (`eval.sh` forces `COMPILE_MODEL=true` when `OVERLAP_STEPS>0`).
 2. **`torch.compile` does not work in this NPU env** — `torch.compile` raises
    `BackendCompilerFailed backend='inductor' ... ModuleNotFoundError: No module named 'triton'`,
-   and the Inductor backend has no Ascend target here. So the graph-compiled async path
-   cannot be reproduced as-is; all numbers above use sync decoding.
-3. Overlap without `skip_stale_actions` (RTC realignment) reuses actions computed
-   `overlap_steps` observations ago; at overlap=3 success collapses (2/5). If async is
-   enabled, `SKIP_STALE_ACTIONS=1` must be set.
+   and the Inductor backend has no Ascend target here (`torchair` is not installed with
+   CANN 8.5.0). So the graph-compiled async path cannot be reproduced as-is; every number
+   above uses eager execution with `compile_model=false`.
+3. **`SKIP_STALE_ACTIONS=1` is not usable at the current shape.** `async_manager.py`
+   rejects `skip_stale_actions` unless `overlap_steps + n_action_steps <= chunk_size`.
+   With this checkpoint (`num_buffer_slots=4`, `chunk_size=10`, `n_action_steps=10`)
+   that reduces to `overlap_steps <= 0`, so any overlap ≥ 1 raises
+   `ValueError: skip_stale_actions requires overlap_steps + n_action_steps <= chunk_size`.
+   Enabling RTC realignment therefore also requires lowering `n_action_steps`
+   (e.g. 5) — a configuration change that has not been evaluated for accuracy here.
+   Do not assume `SKIP_STALE_ACTIONS=1` is a drop-in switch.
 
    **But at the shipped LIBERO config it cannot be set.** `AsyncStreamingActionManager`
    enforces `overlap_steps + n_action_steps <= chunk_size` when RTC is on, and the

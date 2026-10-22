@@ -539,6 +539,10 @@ def bench_main(cfg: BenchConfig):
     for ov in overlaps:
         results["manager"][str(ov)] = measure_manager(policy, batch, device, ov, n_steps, env_ms)
         st = results["manager"][str(ov)]
+        if "mean_ms" not in st:
+            # e.g. a cold-start-only run: every step fell in the first N-1 samples
+            print(f"  overlap={ov}: SKIPPED (no timed steps -- increase BENCH_STEPS)")
+            continue
         print(f"  overlap={ov}: mean={st['mean_ms']:.2f} ms/step p95={st['p95_ms']:.2f} "
               f"max={st['max_ms']:.2f} stall={st.get('policy_stall_ms', 0):.2f}")
 
@@ -567,6 +571,8 @@ def bench_main(cfg: BenchConfig):
           f"prefill {ph['prefill_ms']['mean_ms']:.1f} | "
           f"denoise {ph['denoise_ms']['mean_ms']:.1f} ms")
     for ov, st in results["manager"].items():
+        if "mean_ms" not in st:
+            continue
         print(f"  overlap={ov:>2}: {st['mean_ms']:6.2f} ms/step  p95 {st['p95_ms']:6.2f}  "
               f"blocking-step frac {st.get('fraction_blocking', 0):.2f}")
     if results["peak_hbm_mb"]:
