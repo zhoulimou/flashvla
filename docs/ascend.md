@@ -67,9 +67,45 @@ larger, which is the interesting NPU-side result.
 Run with `--policy.device=npu --policy.n_action_steps=10 --env.max_parallel_tasks=1
 --eval.batch_size=1 --inference_overlap_steps=0 --seed=1000`.
 
-| Suite | Episodes | pc_success | avg_time_per_action_step | notes |
-|---|---|---|---|---|
-| libero_object | 10 tasks × 10 ep | **99.0 %** | 351.1 ms | 100 episodes, 56.3 s/episode, 160.3 steps/episode |
+10 episodes per task, seed 1000, sync decoding (`--inference_overlap_steps=0`):
+
+| Suite | pc_success | avg steps/ep | s/episode | ms/action step | eval wall time |
+|---|---|---|---|---|---|
+| libero_spatial | **96.0 %** (96/100) | 132.2 | 82.4 | 622.9 | 2 h 35 m |
+| libero_object | **99.0 %** (99/100) | 160.3 | 56.3 | 351.1 | 1 h 46 m |
+| libero_goal | **99.0 %** (99/100) | 133.3 | 68.7 | 515.4 | 2 h 10 m |
+| libero_10 | running (10 tasks × 10 ep) | – | ~120 | ~600 | ~3.5 h expected |
+
+Wall time per environment step is dominated by MuJoCo offscreen rendering on CPU
+(llvmpipe) and observation preprocessing — the policy accounts for only ~13 ms of the
+~600 ms per step. That is why the LIBERO numbers here cannot be compared to the paper's
+`Time/Step` metric directly: the paper measures policy time, this table measures whole-loop
+wall time. Paper reference: π0.5 96.9 average, FlashVLA 97.9–98.3 average on LIBERO.
+
+### Async chunk overlap (`--inference_overlap_steps`, `sweep_overlap.py`)
+
+Task `libero_spatial/0`, 5 episodes per setting, same seed, policy loaded once:
+
+| overlap_steps | pc_success | s/episode | ms/action step |
+|---|---|---|---|
+| 0 (sync) | 100 % | 66.8 | 643.2 |
+| 1 | 100 % | 69.4 | 633.0 |
+| 2 | 100 % | 72.2 | 647.9 |
+| 3 (no RTC realignment) | **40 %** | 123.2 | 573.0 |
+
+Two findings:
+
+1. **Overlap buys nothing on this box.** Policy time is ~13 ms/action step while the
+   environment loop costs ~600 ms/action step, so there is at most a ~2 % headroom to hide;
+   the manager's own bookkeeping eats it. Upstream's async mode assumes CUDA-graph compiled
+   dispatch (`eval.sh` forces `COMPILE_MODEL=true` when `OVERLAP_STEPS>0`).
+2. **`torch.compile` does not work in this NPU env** — `torch.compile` raises
+   `BackendCompilerFailed backend='inductor' ... ModuleNotFoundError: No module named 'triton'`,
+   and the Inductor backend has no Ascend target here. So the graph-compiled async path
+   cannot be reproduced as-is; all numbers above use sync decoding.
+3. Overlap without `skip_stale_actions` (RTC realignment) reuses actions computed
+   `overlap_steps` observations ago; at overlap=3 success collapses (2/5). If async is
+   enabled, `SKIP_STALE_ACTIONS=1` must be set.
 
 Partial results are written after every completed task to
 `<output_dir>/eval_info.partial.json` (atomically) and `eval_info.partial.jsonl`, so a
