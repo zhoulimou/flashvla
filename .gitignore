@@ -15,3 +15,7 @@ wandb/
 *.swp
 *.swo
 .DS_Store
+
+# Ascend / CANN build artifacts
+fusion_result.json
+kernel_meta/
