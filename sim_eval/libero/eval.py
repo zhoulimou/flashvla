@@ -59,6 +59,10 @@ from lerobot.utils.utils import (
 
 from flashvla.async_manager import AsyncStreamingActionManager
 
+# Ascend NPU: register the "npu" backend with lerobot's device helpers so
+# `--policy.device=npu` parses instead of raising mid-parse (no-op off NPU).
+import flashvla.npu_support  # noqa: E402,F401
+
 
 @dataclass
 class AsyncEvalPipelineConfig(EvalPipelineConfig):
@@ -74,9 +78,20 @@ class AsyncEvalPipelineConfig(EvalPipelineConfig):
 
 
 def get_safe_torch_device(device):
-    """Get torch device, falling back to CPU if requested device unavailable."""
+    """Get torch device, falling back to CPU if requested device unavailable.
+
+    Ascend NPU support: ``--policy.device=npu`` selects the backend exposed by
+    ``torch_npu`` (auto-loaded by torch when the CANN toolkit is on the env).
+    """
     if device in ("cuda", None) and torch.cuda.is_available():
         return torch.device("cuda")
+    if isinstance(device, str) and device.startswith("npu"):
+        try:
+            import torch_npu  # noqa: F401
+            if torch.npu.is_available():
+                return torch.device(device)
+        except Exception:
+            pass
     return torch.device("cpu")
 
 
