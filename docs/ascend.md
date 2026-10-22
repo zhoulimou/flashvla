@@ -111,6 +111,21 @@ Two findings:
    `overlap_steps` observations ago; at overlap=3 success collapses (2/5). If async is
    enabled, `SKIP_STALE_ACTIONS=1` must be set.
 
+   **But at the shipped LIBERO config it cannot be set.** `AsyncStreamingActionManager`
+   enforces `overlap_steps + n_action_steps <= chunk_size` when RTC is on, and the
+   checkpoint ships `chunk_size = 10` with `n_action_steps = 10`, so any
+   `overlap_steps >= 1` raises `ValueError: skip_stale_actions requires overlap_steps +
+   n_action_steps <= chunk_size`. There are only two consistent options:
+
+   * `n_action_steps=10`, `SKIP_STALE_ACTIONS=0` — RTC off, overlap >= 3 degrades
+     accuracy (the 2/5 above);
+   * `n_action_steps=5`, `SKIP_STALE_ACTIONS=1` — the constraint is satisfied
+     (`5 + 5 <= 10`) and RTC can realign, at the cost of a different execution
+     cadence than the reference numbers.
+
+   Any overlap sweep measured with RTC off is not comparable to an RTC-enabled run;
+   `bench_npu.py` records the setting as `skip_stale_actions` in its JSON output.
+
 Partial results are written after every completed task to
 `<output_dir>/eval_info.partial.json` (atomically) and `eval_info.partial.jsonl`, so a
 crashed run keeps the tasks it already finished. The final `eval_info.json` still contains

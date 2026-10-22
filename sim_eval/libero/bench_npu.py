@@ -186,11 +186,10 @@ def instrumented_chunk(policy, batch: dict, device: torch.device) -> dict:
     buffer = model.sample_noise((bsz, buf_len, action_dim), dev)
 
     t0 = _timed(device)
-    ctx = _amp_ctx()
-    ctx.__enter__()
-    prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
-        images, img_masks, tokens, masks
-    )
+    with _amp_ctx():
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
+            images, img_masks, tokens, masks
+        )
     t1 = _timed(device)
 
     for layer in model.layers:
@@ -206,16 +205,20 @@ def instrumented_chunk(policy, batch: dict, device: torch.device) -> dict:
 
     time_per_slot = torch.arange(1, N + 1, device=dev, dtype=torch.float32) / N
     time = time_per_slot.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
-    v_t = model.denoise_step(prefix_pad_masks, prefix_att_masks, state, buffer, time, padding_mask=None)
-    ctx.__exit__(None, None, None)
+    with _amp_ctx():
+        v_t = model.denoise_step(
+            prefix_pad_masks, prefix_att_masks, state, buffer, time, padding_mask=None
+        )
     t3 = _timed(device)
 
-    # keep the same buffer update as the real path so the following
-    # uninstrumented calls stay numerically on-distribution
+    # Mirror ``_steady_streaming``'s buffer update exactly (graduate the
+    # left slot, shift left, append fresh noise) so the following
+    # uninstrumented calls stay numerically on-distribution.
     dt = 1.0 / N
     buffer = buffer - dt * v_t
-    model.sample_noise(buffer.shape, dev)
-    del hidden, conds
+    new_buffer = model.sample_noise((bsz, buf_len, action_dim), dev)
+    new_buffer[:, :-C, :] = buffer[:, C:, :]
+    del hidden, conds, new_buffer
 
     return {
         "encode_ms": t1 - t0,
@@ -237,18 +240,26 @@ def measure_chunks(policy, batch, device, n_chunks: int, n_warmup: int) -> dict:
         _sync(device)
         for _ in range(n_chunks):
             start = perf_counter() * 1000.0
-            ctx = _amp_ctx()
-            ctx.__enter__()
-            policy.predict_action_chunk(batch)
-            ctx.__exit__(None, None, None)
+            with _amp_ctx():
+                policy.predict_action_chunk(batch)
             _sync(device)
             warm_lat.append(perf_counter() * 1000.0 - start)
     lat = warm_lat
     stats = _stats(lat)
     stats["n_action_steps"] = int(n_action_steps)
     stats["chunk_size"] = int(policy.model.C)
+    # One ``predict_action_chunk`` call in FlashVLA graduates exactly one
+    # slot, i.e. ``C`` executable actions, not ``n_action_steps`` chunks.
+    # The amortised per-action cost is therefore mean / C; dividing by
+    # ``n_action_steps`` only holds when C == n_action_steps (the LIBERO
+    # config). Report both so the definition is never ambiguous.
+    stats["time_per_action_ms"] = stats["mean_ms"] / max(1, int(stats["chunk_size"]))
     stats["time_per_action_step_ms"] = stats["mean_ms"] / n_action_steps
     stats["time_per_action_step_median_ms"] = stats["median_ms"] / n_action_steps
+    stats["time_per_action_step_note"] = (
+        "mean_ms / n_action_steps; equals mean_ms / chunk_size when "
+        "chunk_size == n_action_steps"
+    )
     return stats
 
 
@@ -294,28 +305,26 @@ def measure_vanilla_cached(
     with torch.inference_mode():
         for _ in range(n):
             x = model.sample_noise((bsz, C, action_dim), dev)
-            ctx = _amp_ctx()
-            ctx.__enter__()
-            start = perf_counter() * 1000.0
-            prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
-                images, img_masks, tokens, masks
-            )
-            for layer in model.layers:
-                layer.self_attn.attn.reset_cache()
-            prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
-                prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
-            )
-            hidden = [prefix_embs, None]
-            conds = [None, None]
-            for layer in model.layers:
-                hidden = layer(hidden, prefix_attention_mask, prefix_position_ids, conds, use_cache=True)
-            for step in range(denoise_steps):
-                t = torch.full((bsz, C), step * dt, device=dev, dtype=torch.float32)
-                v_t = model.denoise_step(
-                    prefix_pad_masks, prefix_att_masks, state, x, t, padding_mask=None
+            with _amp_ctx():
+                start = perf_counter() * 1000.0
+                prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
+                    images, img_masks, tokens, masks
                 )
-                x = x - dt * v_t
-            ctx.__exit__(None, None, None)
+                for layer in model.layers:
+                    layer.self_attn.attn.reset_cache()
+                prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
+                    prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
+                )
+                hidden = [prefix_embs, None]
+                conds = [None, None]
+                for layer in model.layers:
+                    hidden = layer(hidden, prefix_attention_mask, prefix_position_ids, conds, use_cache=True)
+                for step in range(denoise_steps):
+                    t = torch.full((bsz, C), step * dt, device=dev, dtype=torch.float32)
+                    v_t = model.denoise_step(
+                        prefix_pad_masks, prefix_att_masks, state, x, t, padding_mask=None
+                    )
+                    x = x - dt * v_t
             _sync(device)
             chunks.append(perf_counter() * 1000.0 - start)
 
@@ -353,25 +362,23 @@ def measure_vanilla(policy, batch: dict, device: torch.device, n: int, denoise_s
         for _ in range(n):
             x = model.sample_noise((bsz, C, action_dim), dev)
             start = perf_counter() * 1000.0
-            ctx = _amp_ctx()
-            ctx.__enter__()
-            for step in range(denoise_steps):
-                prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
-                    images, img_masks, tokens, masks
-                )
-                for layer in model.layers:
-                    layer.self_attn.attn.reset_cache()
-                prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
-                    prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
-                )
-                hidden = [prefix_embs, None]
-                conds = [None, None]
-                for layer in model.layers:
-                    hidden = layer(hidden, prefix_attention_mask, prefix_position_ids, conds, use_cache=True)
-                t = torch.full((bsz, C), step * dt, device=dev, dtype=torch.float32)
-                v_t = model.denoise_step(prefix_pad_masks, prefix_att_masks, state, x, t, padding_mask=None)
-                x = x - dt * v_t
-            ctx.__exit__(None, None, None)
+            with _amp_ctx():
+                for step in range(denoise_steps):
+                    prefix_embs, prefix_pad_masks, prefix_att_masks = model.prefix_embedder(
+                        images, img_masks, tokens, masks
+                    )
+                    for layer in model.layers:
+                        layer.self_attn.attn.reset_cache()
+                    prefix_attention_mask, prefix_position_ids = build_attention_mask_and_position_ids(
+                        prefix_pad_masks, prefix_att_masks, prefix_embs.dtype,
+                    )
+                    hidden = [prefix_embs, None]
+                    conds = [None, None]
+                    for layer in model.layers:
+                        hidden = layer(hidden, prefix_attention_mask, prefix_position_ids, conds, use_cache=True)
+                    t = torch.full((bsz, C), step * dt, device=dev, dtype=torch.float32)
+                    v_t = model.denoise_step(prefix_pad_masks, prefix_att_masks, state, x, t, padding_mask=None)
+                    x = x - dt * v_t
             _sync(device)
             chunks.append(perf_counter() * 1000.0 - start)
 
@@ -391,7 +398,17 @@ def measure_manager(policy, batch, device, overlap: int, n_steps: int, env_ms: f
     that work is what the pipelining hides behind.
     """
     n_action_steps = policy.config.n_action_steps
-    mgr = AsyncStreamingActionManager(policy=policy, overlap_steps=overlap, skip_stale_actions=False)
+    # NOTE (review F2): ``skip_stale_actions`` (RTC realignment) is disabled
+    # here, matching the async rollout in eval.py under SKIP_STALE_ACTIONS=0.
+    # It *cannot* be enabled at the shipped LIBERO config: async_manager
+    # enforces ``overlap_steps + n_action_steps <= chunk_size``, and
+    # chunk_size == n_action_steps == 10 leaves no headroom for overlap >= 1.
+    # Any overlap-sweep number produced with this flag off is therefore not
+    # comparable to an RTC-enabled run.
+    skip_stale = os.environ.get("SKIP_STALE_ACTIONS", "0") == "1"
+    mgr = AsyncStreamingActionManager(
+        policy=policy, overlap_steps=overlap, skip_stale_actions=skip_stale
+    )
     mgr.reset()
     lat: list[float] = []
     env_sleep = max(0.0, env_ms) / 1000.0
@@ -414,6 +431,7 @@ def measure_manager(policy, batch, device, overlap: int, n_steps: int, env_ms: f
         stats["policy_stall_ms"] = float(stats["mean_ms"] - env_ms)
     stats["overlap_steps"] = int(overlap)
     stats["sim_env_ms"] = float(env_ms)
+    stats["skip_stale_actions"] = bool(skip_stale)
     return stats
 
 

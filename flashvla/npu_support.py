@@ -48,6 +48,42 @@ def apply() -> None:
     orig_auto_select = du.auto_select_torch_device
     orig_is_amp = du.is_amp_available
 
+    def undo() -> None:
+        du.is_torch_device_available = orig_is_available
+        du.auto_select_torch_device = orig_auto_select
+        du.is_amp_available = orig_is_amp
+        du._flashvla_npu_patched = False
+        du._flashvla_npu_unpatch = None
+        for mod_name in ("lerobot.configs.policies", "lerobot.policies.factory"):
+            try:
+                mod = __import__(mod_name, fromlist=["_"])
+            except Exception:
+                continue
+            if hasattr(mod, "is_torch_device_available"):
+                mod.is_torch_device_available = orig_is_available
+            if hasattr(mod, "auto_select_torch_device"):
+                mod.auto_select_torch_device = orig_auto_select
+            if hasattr(mod, "is_amp_available"):
+                mod.is_amp_available = orig_is_amp
+
+    def undo() -> None:
+        du.is_torch_device_available = orig_is_available
+        du.auto_select_torch_device = orig_auto_select
+        du.is_amp_available = orig_is_amp
+        du._flashvla_npu_patched = False
+        du._flashvla_npu_unpatch = None
+        for mod_name in ("lerobot.configs.policies", "lerobot.policies.factory"):
+            try:
+                mod = __import__(mod_name, fromlist=["_"])
+            except Exception:
+                continue
+            if hasattr(mod, "is_torch_device_available"):
+                mod.is_torch_device_available = orig_is_available
+            if hasattr(mod, "auto_select_torch_device"):
+                mod.auto_select_torch_device = orig_auto_select
+            if hasattr(mod, "is_amp_available"):
+                mod.is_amp_available = orig_is_amp
+
     def is_torch_device_available(try_device: str) -> bool:
         if is_npu_device(try_device):
             return torch.npu.is_available()
@@ -61,8 +97,12 @@ def apply() -> None:
         return orig_auto_select()
 
     def is_amp_available(device: str) -> bool:
+        # Empirically, ``torch.autocast("npu", bfloat16)`` is *slower* than
+        # fp32 on 910B3 (measured 256.0 vs 134.2 ms/chunk), so AMP must not
+        # be advertised as available: lerobot uses this helper to auto-enable
+        # AMP, which would silently halve throughput.
         if is_npu_device(device):
-            return True
+            return False
         return orig_is_amp(device)
 
     du.is_torch_device_available = is_torch_device_available
@@ -82,6 +122,36 @@ def apply() -> None:
             mod.auto_select_torch_device = auto_select_torch_device
         if hasattr(mod, "is_amp_available"):
             mod.is_amp_available = is_amp_available
+
+    du._flashvla_npu_unpatch = undo
+
+
+def unpatch() -> None:
+    """Restore lerobot's original device helpers (undo :func:`apply`).
+
+    Needed when a single process has to fall back to the stock CUDA path,
+    e.g. a test that checks both branches. No-op if ``apply`` never ran.
+    """
+    from lerobot.utils import device_utils as du
+
+    undo = getattr(du, "_flashvla_npu_unpatch", None)
+    if undo is not None:
+        undo()
+
+    du._flashvla_npu_unpatch = undo
+
+
+def unpatch() -> None:
+    """Restore lerobot's original device helpers (undo :func:`apply`).
+
+    Needed when a single process has to fall back to the stock CUDA path,
+    e.g. a test that checks both branches. No-op if ``apply`` never ran.
+    """
+    from lerobot.utils import device_utils as du
+
+    undo = getattr(du, "_flashvla_npu_unpatch", None)
+    if undo is not None:
+        undo()
 
 
 apply()

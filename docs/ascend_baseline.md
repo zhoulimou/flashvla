@@ -142,5 +142,16 @@ SUITE=libero_10      EPS=10 CARD=0 TAG=libero10  bash run_eval_generic.sh
 ```
 
 `run_bench.sh` / `run_eval_generic.sh` are documented in [docs/ascend.md](ascend.md);
-raw results land in `/home/data/flashvla/logs/bench_npu/*.json` and
+both wrappers live at the repo root and select the chip, the Ascend runtime, the
+offline-HF flags and the log location; `bench_npu.py` reads its own `BENCH_*` switches
+from the environment.
+
+**Metric definition.** One `predict_action_chunk` call in FlashVLA graduates exactly one
+buffer slot, i.e. `C` executable actions — not `n_action_steps` chunks. `Time/Step` is
+`mean_ms / n_action_steps`, which equals `mean_ms / C` only because the LIBERO config
+happens to have `chunk_size == n_action_steps == 10`. The benchmark now also emits
+`time_per_action_ms = mean_ms / chunk_size` and a `time_per_action_step_note` so the
+two definitions cannot be confused when the configs diverge.
+
+Raw results land in `/home/data/flashvla/logs/bench_npu/*.json` and
 `/home/data/flashvla/logs/<tag>_out/eval_info.json`.

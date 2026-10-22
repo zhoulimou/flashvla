@@ -779,22 +779,26 @@ def eval_policy_all(
         only_record_failures=only_record_failures,
     )
 
-    def _dump_partial(tg: str, tid: int, metrics: dict) -> None:
+    def _dump_partial(tg: str, tid: int, metrics: dict, infos: list[dict]) -> None:
         """Persist per-task progress so a crash does not lose finished tasks.
 
         ``eval_info.json`` is only written after *every* task finished; a crash or
         SIGKILL late in a multi-hour eval would otherwise discard all episodes.
+
+        ``infos`` carries the accumulated per-task records explicitly: relying on
+        the closure's late-bound ``per_task_infos`` silently produced a truncated
+        payload whenever the caller had not appended the current task yet.
         """
         if output_dir is None:
             return
         try:
             out = Path(output_dir)
             out.mkdir(parents=True, exist_ok=True)
-            succ = [x for info in per_task_infos for x in info["metrics"].get("successes", [])]
+            succ = [x for info in infos for x in info["metrics"].get("successes", [])]
             payload = {
                 "partial": True,
                 "last_task": {"task_group": tg, "task_id": tid},
-                "tasks_done": len(per_task_infos),
+                "tasks_done": len(infos),
                 "tasks_total": len(tasks),
                 "n_episodes": len(succ),
                 "pc_success_so_far": (100.0 * sum(succ) / len(succ)) if succ else None,
