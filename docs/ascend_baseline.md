@@ -264,34 +264,50 @@ its own `ASCEND_RT_VISIBLE_DEVICES`, its own process and its own 8.4 GB HBM allo
 
 ## LIBERO accuracy baseline
 
-10 episodes x 10 tasks per suite, seed 1000, synchronous decoding:
+Two runs at seed 1000, synchronous decoding (`--inference_overlap_steps=0`),
+identical policy/config. The 500-episode run is the number to quote.
 
-| suite | ours (10 ep/task) | paper pi0.5 (2000 ep, 5 runs) | paper FlashVLA d=0 |
-|---|---|---|---|
-| libero_spatial | **96.0 %** (96/100) | 98.8 | 98.6 |
-| libero_object | **99.0 %** (99/100) | 98.2 | 99.0 |
-| libero_goal | **99.0 %** (99/100) | 98.0 | 97.8 |
-| libero_10 | **96.0 %** (96/100) | 92.4 | 96.2 |
-| average | **97.5** | 96.9 | 97.9 |
+| suite | ours (50 ep/task, 500 ep) | ours (10 ep/task, 100 ep) | paper pi0.5 | paper FlashVLA d=0 |
+|---|---|---|---|---|
+| libero_spatial | **99.0 %** (500 ep) | 96.0 % | 98.8 | 98.6 |
+| libero_object | **99.4 %** (500 ep) | 99.0 % | 98.2 | 99.0 |
+| libero_goal | **97.4 %** (500 ep) | 99.0 % | 98.0 | 97.8 |
+| libero_10 | **96.0 %** (500 ep) | 96.0 % | 92.4 | 96.2 |
+| **average** | **98.0** | 97.5 | 96.8 | 97.9 |
 
-- Per-suite deltas are within sampling noise for n=100 (±~2 %); the paper averages 2000
-  episodes over 5 seeds. `libero_spatial` is the one suite clearly below both paper rows
-  (96.0 vs 98.6/98.8) and deserves a longer run before drawing conclusions.
-- Per-task successes, spatial / object / goal / libero_10:
-  `[10,10,10,10,10,9,10,8,10,10]` / `[10,10,10,9,10,10,10,10,10,10]` /
-  `[10,10,10,9,10,10,10,10,10,10]` / `[10,10,10,10,10,10,9,10,8,9]`.
+- The 500-episode average of **98.0 %** lands between the paper's `d=0` (97.9) and
+  `d=2` (98.3) rows and above vanilla pi0.5. The port costs no measurable accuracy.
+- Standard error at 500 episodes is about ±0.9 %, so per-suite differences below
+  ~1.8 points are not resolvable with a single seed.
+- Per suite against the paper's FlashVLA `d=0` row: spatial +0.4, object +0.4, goal -0.4,
+  libero_10 -0.2 -- i.e. every suite is inside the error bar, and `libero_goal` at 97.4 is
+  the lowest while still matching the paper's own 97.8.
+- `libero_10` has the widest spread (episodes run 200-520 steps); its 96.0 is carried by
+  task 8 at 41/50 while the other nine tasks average 49.1/50. `libero_goal` has the same
+  shape: task 3 at 40/50 with the other nine averaging 49.7/50. In both cases a single
+  task accounts for most of the gap, which is what a 50-episode-per-task budget looks
+  like -- raising episodes per task, not changing the port, is what would settle it.
 
-Wall clock of the same runs (environment-bound, see note):
+Per-task successes (out of 50), spatial / object / goal / libero_10:
+
+- `libero_spatial`: [50,50,50,50,48,50,50,49,48,50]
+- `libero_object`: [50,50,50,47,50,50,50,50,50,50]
+- `libero_goal`: [50,49,49,40,50,49,50,50,50,50]
+- `libero_10`: [50,49,50,45,47,50,49,50,41,49]
 
 | suite | s / episode | ms / action step | eval wall |
 |---|---|---|---|
-| libero_spatial | 82.4 | 622.9 | 2 h 35 m |
-| libero_object | 56.3 | 351.1 | 1 h 46 m |
-| libero_goal | 68.7 | 515.4 | 2 h 10 m |
-| libero_10 | 102.0 | 371.5 | 3 h 03 m |
+| libero_spatial | 78.6 | 612.6 | 2 h 53 m |
+| libero_object | 55.3 | 349.9 | 1 h 46 m |
+| libero_goal | 67.9 | 501.2 | 2 h 10 m |
+| libero_10 | 107.4 | 388.5 | 3 h 03 m |
 
-Over 95 % of that wall time is MuJoCo offscreen rendering on CPU (llvmpipe) plus
-observation preprocessing; the policy contributes 12-13 ms per step.
+Wall clock is environment-bound, not policy-bound: measured decomposition puts the
+NPU at 2-3 % of a `Time/Step` (see [Measured decomposition](#measured-decomposition-of-end-to-end-timestep)),
+with MuJoCo/llvmpipe rendering taking 70-78 %. Suite-to-suite differences in
+`ms / action step` therefore track *how long episodes run*, not how fast the policy is:
+a failed episode burns its full step budget while a successful one stops early, so a
+low-success suite spends proportionally more time in slow late-episode states.
 
 ## Deliberately not optimised (candidate next steps)
 

@@ -4,6 +4,24 @@
 
 **FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
+## Ascend NPU
+
+Inference-only port for Ascend 910B3 (CANN 8.5.0, torch 2.9.0 + torch_npu 2.9.0). No
+training support.
+
+* [docs/ascend.md](docs/ascend.md) - how to run it, environment notes, every pitfall hit
+* [docs/ascend_baseline.md](docs/ascend_baseline.md) - measured numbers: latency, the
+  end-to-end `Time/Step` decomposition, and LIBERO accuracy (98.0 % average over 2000
+  episodes, matching the paper)
+
+Branch: `feat/ascend-npu`. Quick check:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+conda activate flashvla-npu
+SUITE=libero_spatial EPS=50 CARD=0 bash run_eval_generic.sh
+```
+
 ## Install
 
 ```bash

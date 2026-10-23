@@ -83,21 +83,32 @@ more expensive here (no fused kernels), while the absolute latency is ~4.9x the 
 Run with `--policy.device=npu --policy.n_action_steps=10 --env.max_parallel_tasks=1
 --eval.batch_size=1 --inference_overlap_steps=0 --seed=1000`.
 
-10 episodes per task, seed 1000, sync decoding (`--inference_overlap_steps=0`):
+Two budgets, both seed 1000 sync decoding (`--inference_overlap_steps=0`). The 500-episode
+run is the number to quote:
 
-| Suite | pc_success | avg steps/ep | s/episode | ms/action step | eval wall time |
+| Suite | 50 ep/task (500 ep) | 10 ep/task (100 ep) | avg steps/ep | s/episode | ms/action step |
 |---|---|---|---|---|---|
-| libero_spatial | **96.0 %** (96/100) | 132.2 | 82.4 | 622.9 | 2 h 35 m |
-| libero_object | **99.0 %** (99/100) | 160.3 | 56.3 | 351.1 | 1 h 46 m |
-| libero_goal | **99.0 %** (99/100) | 133.3 | 68.7 | 515.4 | 2 h 10 m |
-| libero_10 | **96.0 %** (96/100) | 274.7 | 102.0 | 371.5 | 3 h 03 m |
+| libero_spatial | **99.0 %** | 96.0 % | 128.3 | 78.6 | 612.6 |
+| libero_object | **99.4 %** | 99.0 % | 158.2 | 55.3 | 349.9 |
+| libero_goal | **97.4 %** | 99.0 % | 135.5 | 67.9 | 501.2 |
+| libero_10 | **96.0 %** | 96.0 % | 276.4 | 107.4 | 388.5 |
+| **average** | **98.0** | 97.5 | | | |
+
+Paper reference: π0.5 96.9 average, FlashVLA 97.9 (`d=0`) – 98.3 (`d=2`) average on LIBERO,
+2000 episodes × 5 seeds. Our 500-episode average of 98.0 sits inside that band, so the port
+shows no measurable accuracy loss. At 500 episodes the standard error is ±0.9 %, so
+differences under ~1.8 points are not resolvable from a single seed.
 
 Wall time per environment step is dominated by MuJoCo offscreen rendering on CPU
-(llvmpipe) and observation preprocessing — the policy accounts for only ~13 ms of the
-~600 ms per step. That is why the LIBERO numbers here cannot be compared to the paper's
+(llvmpipe) and observation preprocessing — measured decomposition puts the policy at
+2-3 % of an end-to-end step (`sim_eval/libero/eval.py` rollout loop instrumented with
+`perf_counter`). That is why the LIBERO numbers here cannot be compared to the paper's
 `Time/Step` metric directly: the paper measures policy time, this table measures whole-loop
-wall time. Paper reference: π0.5 96.9 average, FlashVLA 97.9–98.3 average on LIBERO.
-Our four-suite average (10 episodes per task): **97.5**.
+wall time. See [docs/ascend_baseline.md](ascend_baseline.md) for both, spelled out.
+
+Per-task successes out of 50 (spatial / object / goal / libero_10):
+`[50,50,50,50,48,50,50,49,48,50]` / `[50,50,50,47,50,50,50,50,50,50]` /
+`[50,49,49,40,50,49,50,50,50,50]` / `[50,49,50,45,47,50,49,50,41,49]`.
 
 ### Async chunk overlap (`--inference_overlap_steps`)
 
