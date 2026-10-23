@@ -56,7 +56,22 @@ how to run things).
   cheaper image encoder path) would remove most of it.
 - Peak HBM: **8424 MB** per process at batch 1.
 
-## Vanilla pi0.5 decoding, same weights, same chip
+## Vanilla pi0.5-style decoding, same weights, same chip
+
+> **Naming caveat.** This section does *not* evaluate the pi0.5 model. No pi0.5
+> checkpoint is installed on this node; both rows below run the **FlashVLA
+> checkpoint** through a hand-written pi0.5-shaped sampler
+> (`sim_eval/libero/bench_npu.py:283 measure_vanilla_cached`, which takes
+> `model = policy.model` and swaps 1 denoise step for 10). Call the resulting
+> figures *pi0.5-style decoding*, not *pi0.5*. Two structural differences from a
+> real pi0.5 evaluation remain: (a) the weights were fine-tuned under the
+> FlashVLA recipe, and (b) the buffer is `C = 10` here against pi0.5's native
+> `chunk = 50`, and the amortisation is 10 forwards / 10 actions = **1 forward
+> per action step**, whereas a real pi0.5 (chunk 50, replan every 5) pays **2
+> forwards per action step**. Point (b) makes this baseline *cheaper* than real
+> pi0.5, so the speedup below is, if anything, conservative. Replacing this row
+> with a genuine pi0.5 run (`lerobot/pi05_libero_base`, `--policy.type=pi05`) is
+> an open item, tracked under "Open items" at the end of this file.
 
 The honest question is "what would the original sampler cost here".
 
@@ -86,10 +101,15 @@ reuse, not a like-for-like comparison. For reference, the upstream README's RTX 
 README reference (RTX 4090, 2 views, `benchmarks/benchmark_latency.py`, 100 samples after
 10 warm-up): pi0.5 **45.8 ms/chunk**, FlashVLA **26.7 ms/chunk** -> **1.72x**.
 
-| device | pi0.5 | FlashVLA | ratio |
-|---|---|---|---|
-| RTX 4090 | 45.8 ms | 26.7 ms | 1.72x |
-| 910B3 | 559 ms | 130 ms | **4.3x** |
+| device | pi0.5 decoder | FlashVLA decoder | ratio | comparable? |
+|---|---|---|---|---|
+| RTX 4090 | 45.8 ms (pi0.5 **model**) | 26.7 ms (FlashVLA **model**) | 1.72x | reference |
+| 910B3 | 559 ms (pi0.5 **sampler on FlashVLA weights**) | 130 ms (FlashVLA, same weights) | **4.3x** | **not model-to-model** |
+
+The two rows are not the same experiment. The paper's 1.72x compares two *models*;
+the 4.3x here compares two *decoding loops over one checkpoint*. The 4.3x is therefore
+evidence that single-step decoding pays off on this chip, not evidence that FlashVLA beats
+pi0.5 by 4.3x on Ascend.
 
 - Absolute: FlashVLA on 910B3 is ~**4.9x slower** than on a 4090 (130 vs 26.7 ms);
   pi0.5 is ~**12.2x slower** (559 vs 45.8 ms).
@@ -209,6 +229,11 @@ Only the first two rows below are legitimate cross-platform comparisons.
 | FlashVLA inference Time/Step (chunk/10) | 2.67 ms | **12.95 ms** | 4.85x slower |
 | **FlashVLA algorithmic speedup (π0.5 -> FlashVLA)** | **1.72x** | **4.32x** | — |
 | end-to-end Time/Step | 20.6 ms (d=2, GPU env) | 350-613 ms (CPU env) | **not comparable** |
+The paper's Tab. 1 covers d>=1 only: the FlashVLA row at d=0 is a dash, and its accuracy for
+that setting lives in Tab. 3 (97.9 %). So there is **no paper Time/Step to compare a d=0 run
+against** — the d=0 here is a porting baseline, not a reproduction of a paper row. The
+comparable pairs are the two accuracy numbers at d=0 (paper 97.9 vs 98.0 here) and, once
+measured, Time/Step at d=1/d=2.
 
 ### Caveats on the 4.85x latency ratio
 
@@ -226,12 +251,18 @@ ratio and should not be quoted as one:
    `n_action_steps=10` for both methods. That gives the pi0.5 baseline here a *more*
    favourable budget, so our 12.2x pi0.5 penalty is conservative and the 4.32x algorithmic
    speedup is, if anything, slightly understated.
-3. **The 4.32x is synchronous (d=0).** The paper's headline 2.43x/2.62x end-to-end speedups
-   are at d=1/d=2 and include prediction-execution overlap, which is a different thing from
-   the decoder ratio. Decoder work 1.72x (paper) vs 4.32x (here) and end-to-end 2.43-2.62x
-   (paper) are not column-comparable. This port cannot measure d>=1 at the shipped
-   configuration: `async_manager.py:74-84` rejects `overlap_steps + n_action_steps >
-   chunk_size`, and `chunk_size = n_action_steps = 10` forces overlap 0.
+3. **The 4.32x is synchronous (d=0), and d>=1 has not been measured yet.** The paper's
+   headline 2.43x/2.62x end-to-end speedups are at d=1/d=2 and include
+   prediction-execution overlap, which is a different thing from the decoder ratio, so
+   decoder work 1.72x (paper) vs 4.32x (here) and end-to-end 2.43-2.62x (paper) are not
+   column-comparable. d>=1 *is* runnable here — the only hard bound is
+   `overlap_steps <= n_action_steps` (`async_manager.py:71-74`); the tighter
+   `overlap_steps + n_action_steps <= chunk_size` bound at `async_manager.py:75-86` applies
+   **only when `skip_stale_actions=True`**, and `sim_eval/libero/eval.py:153` defaults that
+   to `False` (`SKIP_STALE_ACTIONS` unset). With `n_action_steps = chunk_size = 10` the
+   shipped config can raise `--inference_overlap_steps` up to 10; the reason no d>=1 row
+   appears above is that the 2000-episode accuracy run was deliberately kept synchronous,
+   not that the code forbids it.
 4. **Time/Step scales with success.** Failed episodes burn their full step budget, so a
    low-success suite reports a higher ms/step at identical policy speed. The paper hit this
    too and collapsed its chunk-size sweep into one number (1.8x) for exactly this reason.
@@ -388,6 +419,27 @@ low-success suite spends proportionally more time in slow late-episode states.
 4. **Batching / multi-chip** — untested; this baseline is batch 1 on one chip.
 5. **Startup** — 320 s -> 2.8 s is available, but kept opt-in so the default path stays
    bit-for-bit the upstream one.
+
+## Open items
+
+Things that are known-missing and would change a number above if resolved. Recorded here so
+they cannot be forgotten between sessions.
+
+1. **Real pi0.5 baseline (blocking a clean paper comparison).** No pi0.5 checkpoint is
+   installed; every "pi0.5" timing in this file is pi0.5-*style* decoding over the FlashVLA
+   checkpoint (see the naming caveat above). The genuine baseline is
+   `lerobot/pi05_libero_base` (public, non-gated) evaluated with `--policy.type=pi05`, which
+   would also reproduce the paper's Tab. 3 pi0.5 accuracy row (98.8 / 98.2 / 98.0 / 92.4,
+   avg 96.9). Until then the accuracy claim is "FlashVLA scores 98.0 % on 910B3", and the
+   claim "FlashVLA improves on pi0.5 by +1.1 points here" is **unverified on this hardware** —
+   it is imported from the paper, not measured. Unverified also: whether
+   `AsyncStreamingActionManager` can drive a non-streaming policy
+   (`async_manager.py:85-90` `_is_streaming` branch).
+2. **d >= 1 accuracy and Time/Step.** Runnable (see the caveat in the same-metric section)
+   but not run yet. Needed to compare against the paper's 22.1 / 20.6 ms rows.
+3. **RoboTwin 2.0 — entirely unstarted.** Checkpoint is downloaded (16 GB, chunk 20,
+   N=4), but RoboTwin itself is not installed and SAPIEN on aarch64/Ascend is unverified.
+4. **Multi-seed accuracy.** Every number here is one seed. The paper averages five runs.
 
 ## Reproduce
 
