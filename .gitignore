@@ -19,3 +19,8 @@ wandb/
 # Ascend / CANN build artifacts
 fusion_result.json
 kernel_meta/
+
+# Backup files created by scripted doc edits
+*.bak
+*.bak[0-9]*
+*.bak.*
