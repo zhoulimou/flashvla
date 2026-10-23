@@ -163,6 +163,43 @@ Reading:
 
 ## Same-metric comparison against the paper
 
+### How the paper measured these numbers
+
+Three different quantities are reported in the paper (arXiv:2608.27384) and they must not be
+mixed:
+
+| paper metric | what it is | how the paper measures it | value |
+|---|---|---|---|
+| **Inference latency** (Tab. 2) | one `policy()` invocation | 100 samples after 10 warm-up iterations, CUDA Graph + kernel fusion **on for both** pi0.5 and FlashVLA | pi0.5 **45.8 ms**, FlashVLA **26.7 ms** (RTX 4090, 2 views) |
+| **Time/Step** (Tab. 1) | closed-loop episode wall time / executed steps | LeRobot's LIBERO eval script, "including rendering time" (App. A.1) | pi0.5 **53.8 ms**; FlashVLA **22.1 ms** (d=1), **20.6 ms** (d=2) |
+| **decoding-work speedup** (Sec. 1 fn. 1) | passes x cost, not wall clock | profiling experiment | **9.3x** fewer GPU work, **19.9x** wall-clock after removing launch serialisation |
+
+The README says it explicitly: *"Inference latency measures one policy invocation after
+warm-up; it is not Time/Step."* Only the inference-latency row is a pure policy number, so
+only that row can be compared across hardware.
+
+Measurement conditions, side by side:
+
+| item | paper | this port | same? |
+|---|---|---|---|
+| inference-latency sampling | 10 warm-up + 100 timed | 4 warm-up + 40 timed | close enough (our std is 0.6-6 ms) |
+| camera views | 2 (and 3) | 2 (`agentview_image` + `robot0_eye_in_hand_image`) | **yes**, matches the 26.7 ms column |
+| system optimisation | CUDA Graph + kernel fusion, **applied to both methods equally** | **none** — no `triton`/Inductor on Ascend, `torchair` absent from CANN 8.5.0 | **no** (see caveats below) |
+| LIBERO eval script | LeRobot LIBERO eval | same script | yes |
+| Time/Step definition | episode wall / executed steps, incl. rendering | identical (`sim_eval/libero/eval.py:465`) | yes |
+| replan frequency | pi0.5 replans **every 5 actions**, FlashVLA emits a chunk per step | `n_action_steps=10` for both | **no** — pi0.5 gets a *more* favourable budget here |
+| chunk size / buffer | pi0.5 C=50 (native); FlashVLA C=10, N=4 | C=10, N=4 (pi0.5 baseline uses its native 50) | yes |
+| episodes | 2000 x 5 runs | 2000 x 1 seed | statistics only |
+| renderer | GPU | CPU llvmpipe | **no** |
+
+Two useful confirmations from the paper's own ablations (App. A.3): `C=10, N=4` is exactly
+the reported optimum for LIBERO (`N*C ~= 50`, the native pi0.5 chunk length), so the
+configuration this port measured is not a compromise; and the paper rewrites its own
+chunk-size sweep into a single honest number, noting that *"the apparent improvement at
+larger C is an artifact of lower success rates triggering more reset steps per episode"* --
+the same effect that makes `libero_spatial` (612 ms/step) look slower than `libero_object`
+(350 ms/step) here.
+
 Only the first two rows below are legitimate cross-platform comparisons.
 
 | metric | RTX 4090 (README) | 910B3 (measured) | ratio |
@@ -172,6 +209,36 @@ Only the first two rows below are legitimate cross-platform comparisons.
 | FlashVLA inference Time/Step (chunk/10) | 2.67 ms | **12.95 ms** | 4.85x slower |
 | **FlashVLA algorithmic speedup (π0.5 -> FlashVLA)** | **1.72x** | **4.32x** | — |
 | end-to-end Time/Step | 20.6 ms (d=2, GPU env) | 350-613 ms (CPU env) | **not comparable** |
+
+### Caveats on the 4.85x latency ratio
+
+The 4.85x is honest as an *as-measured, as-shipped* number, but it is not a pure hardware
+ratio and should not be quoted as one:
+
+1. **Framework optimisations differ.** The paper's 26.7 ms runs with CUDA Graph, kernel
+   fusion and max-autotune, applied to pi0.5 and FlashVLA alike (Sec. 3.2: *"orthogonal to
+   the algorithmic design but necessary to realize the full latency benefit in practice"*).
+   Our 129.5 ms is the unoptimised path: `torch.compile` has no Ascend backend in this
+   environment (`BackendCompilerFailed ... No module named 'triton'`) and `torchair` is not
+   installed in CANN 8.5.0. Part of the gap is therefore missing framework support, not
+   hardware.
+2. **Replan frequency differs.** The paper replans pi0.5 every 5 actions; this port uses
+   `n_action_steps=10` for both methods. That gives the pi0.5 baseline here a *more*
+   favourable budget, so our 12.2x pi0.5 penalty is conservative and the 4.32x algorithmic
+   speedup is, if anything, slightly understated.
+3. **The 4.32x is synchronous (d=0).** The paper's headline 2.43x/2.62x end-to-end speedups
+   are at d=1/d=2 and include prediction-execution overlap, which is a different thing from
+   the decoder ratio. Decoder work 1.72x (paper) vs 4.32x (here) and end-to-end 2.43-2.62x
+   (paper) are not column-comparable. This port cannot measure d>=1 at the shipped
+   configuration: `async_manager.py:74-84` rejects `overlap_steps + n_action_steps >
+   chunk_size`, and `chunk_size = n_action_steps = 10` forces overlap 0.
+4. **Time/Step scales with success.** Failed episodes burn their full step budget, so a
+   low-success suite reports a higher ms/step at identical policy speed. The paper hit this
+   too and collapsed its chunk-size sweep into one number (1.8x) for exactly this reason.
+
+What *is* clean: the two rows measured on identical hardware with the identical decoding
+loop -- pi0.5 vs FlashVLA on 910B3 -- because both sides of that ratio share every
+caveat above.
 
 On the paper's algorithmic win: it is **larger** on Ascend (4.32x vs 1.72x) even though
 every absolute number is ~5-12x slower, because the speedup is a ratio against the same
