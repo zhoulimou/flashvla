@@ -812,12 +812,26 @@ def eval_policy_all(
         except Exception as exc:  # noqa: BLE001 - never let bookkeeping kill the eval
             print(f"Warning: failed to write partial eval results: {exc}")
 
+    def _safe_dump_partial(tg: str, tid: int, metrics: dict, infos: list[dict]) -> None:
+        """Call the partial writer without ever letting bookkeeping stop the eval.
+
+        ``_dump_partial`` has its own try/except, but that only covers raises
+        inside the body; an exception while *binding* the arguments (as happened
+        when a parameter was added without updating the call sites) propagates
+        past it. Wrapping at the call site is what actually keeps a multi-hour
+        evaluation alive.
+        """
+        try:
+            _dump_partial(tg=tg, tid=tid, metrics=metrics, infos=infos)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: failed to write partial eval results: {exc}")
+
     if max_parallel_tasks <= 1:
         for task_group, task_id, env in tasks:
             tg, tid, metrics = task_runner(task_group, task_id, env)
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
-            _dump_partial(tg, tid, metrics)
+            _safe_dump_partial(tg, tid, metrics, per_task_infos)
     else:
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
             fut2meta = {}
@@ -828,7 +842,7 @@ def eval_policy_all(
                 tg, tid, metrics = fut.result()
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
-                _dump_partial(tg, tid, metrics)
+                _safe_dump_partial(tg, tid, metrics, per_task_infos)
 
     def _agg_from_list(xs):
         if not xs:

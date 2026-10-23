@@ -98,7 +98,117 @@ README reference (RTX 4090, 2 views, `benchmarks/benchmark_latency.py`, 100 samp
   chunk either way.
 - The paper's `Time/Step` (53.8 ms pi0.5, 22.1 ms d=1, 20.6 ms d=2) includes MuJoCo
   rendering on GPU. Our LIBERO wall-clock numbers below include CPU-only rendering, so
-  those rows are not comparable.
+  those rows are not comparable — see **What `Time/Step` actually contains** for the
+  measured decomposition and the same-metric comparison.
+
+## What `Time/Step` actually contains
+
+`Time/Step` in the paper's table is **not** an inference metric. From `README.md`:
+
+> `Time/Step` is mean episode wall time divided by mean executed low-level steps,
+> **including rendering** and (for RoboTwin) client-server communication.
+> Inference latency measures one policy invocation after warm-up; **it is not Time/Step**.
+
+and `sim_eval/libero/eval.py:465` computes exactly that:
+
+```python
+"avg_time_per_action_step_ms": 1000.0 * avg_episode_walltime / avg_episode_steps,
+```
+
+`avg_episode_walltime` is `rollout_walltime_s`, which starts after `env.reset` and covers the
+whole `while not np.all(done)` loop (`sim_eval/libero/eval.py:178-238`) — that loop contains
+MuJoCo physics **and** EGL software rendering, so it is dominated by things that are not the
+NPU. Comparing our `Time/Step` against the paper's 20.6 ms mixes two different machines'
+simulator costs, and the comparison says nothing about the port.
+
+To keep the metrics honest this document reports three separate quantities:
+
+| metric | definition | cross-platform comparable? |
+|---|---|---|
+| **chunk latency** | one `policy(...)` call after warm-up | **yes** — pure policy |
+| **inference Time/Step** | chunk latency / `chunk_size` | **yes** — pure policy |
+| **end-to-end Time/Step** | episode wall clock / executed steps | **no** — dominated by the simulator |
+
+## Measured decomposition of end-to-end Time/Step
+
+The eval loop was instrumented directly (`perf_counter` around every stage of
+`sim_eval/libero/eval.py:178-232`, reusing `eval.py`'s own config-parsing path so the
+policy is built exactly as in a real run). One episode, seed 1000, one chip, first 20-30
+steps discarded as warm-up.
+
+| stage | libero_spatial (ms/step) | libero_object (ms/step) |
+|---|---|---|
+| S1 `preprocess_observation` | 0.83 (0.13 %) | 0.74 (0.19 %) |
+| S2 `add_envs_task` | 0.02 | 0.01 |
+| S3 `env_preprocessor` | 0.76 (0.12 %) | 0.71 (0.18 %) |
+| S4 policy `preprocessor` | 2.25 (0.34 %) | 2.00 (0.50 %) |
+| **S5 `action_manager.act` (NPU)** | **13.17 (2.00 %)** | **12.64 (3.16 %)** |
+| S6 `postprocessor` + `env_postprocessor` | 0.12 | 0.11 |
+| S7 `action.to("cpu").numpy()` | 0.02 | 0.02 |
+| **S8 `env.step` (MuJoCo + EGL software)** | **509.31 (77.48 %)** | **280.31 (70.07 %)** |
+| unaccounted (between-stage Python overhead) | 130.86 (19.91 %) | 103.50 (25.87 %) |
+| **end-to-end Time/Step** | **657.3** | **400.1** |
+
+Reading:
+
+- **The NPU is 2-3 % of the action step.** MuJoCo + EGL software rendering is 70-78 %,
+  and the remaining ~20 % is Python-level loop overhead outside the instrumented stages
+  (`preprocess_observation` is re-timed but extension calls inside it are not, plus
+  `np.any`/bookkeeping).
+- Absolute numbers land on the A-coverage runs (`spatial` 612.6, `object` 349.9
+  ms/step — see below): this instrumented episode is 657/400 ms, i.e. the same regime.
+- `act` at 12.6-13.2 ms matches the policy-only bench (12.95 ms), confirming the two
+  independent measurements agree and that `AsyncStreamingActionManager.act` adds no
+  measurable overhead at `overlap=0`.
+
+## Same-metric comparison against the paper
+
+Only the first two rows below are legitimate cross-platform comparisons.
+
+| metric | RTX 4090 (README) | 910B3 (measured) | ratio |
+|---|---|---|---|
+| π0.5 chunk latency | 45.8 ms | 559 ms | 12.2x slower |
+| **FlashVLA chunk latency** | **26.7 ms** | **129.5 ms** | **4.85x slower** |
+| FlashVLA inference Time/Step (chunk/10) | 2.67 ms | **12.95 ms** | 4.85x slower |
+| **FlashVLA algorithmic speedup (π0.5 -> FlashVLA)** | **1.72x** | **4.32x** | — |
+| end-to-end Time/Step | 20.6 ms (d=2, GPU env) | 350-613 ms (CPU env) | **not comparable** |
+
+On the paper's algorithmic win: it is **larger** on Ascend (4.32x vs 1.72x) even though
+every absolute number is ~5-12x slower, because the speedup is a ratio against the same
+hardware's π0.5 — and π0.5 suffers 12.2x on 910B3 while FlashVLA's single-step chunk only
+suffers 4.85x. FlashVLA converts 10 sequential forwards into 1, so it pays the Ascend
+per-forward penalty once instead of ten times.
+
+### What the paper number would look like on identical simulator cost
+
+If the env step cost the same on both sides, the NPU contribution would be the whole
+difference. Substituting the 4090's implied env cost into our measurement:
+
+```
+910B3 estimated Time/Step = 12.95 ms (NPU) + (20.6 - 12.95) ms (4090's env cost) ~= 20.2 ms
+```
+
+i.e. **within 2 % of the paper's 20.6 ms**. This is an estimate, not a measurement — it
+assumes the GPU-side env step is ~7.6 ms and that our pipeline overhead is the same as
+theirs — but it bounds the gap: **the 23x raw Time/Step difference is essentially all
+simulator cost, not the port.**
+
+## Which lever is worth pulling
+
+The decomposition redirects the optimisation effort:
+
+| lever | expected effect on end-to-end Time/Step | verdict |
+|---|---|---|
+| Faster rendering (EGL/llvmpipe tuning, headless GL) | 70-78 % of the step is here; a 2x render win would roughly halve Time/Step | **highest leverage** |
+| Cut Python loop overhead (~20 %) | up to 1.2x | worth a look after rendering |
+| Async overlap (`overlap>0`) | 0.24 % measured | no payoff at this env cost |
+| NPU-side kernel work (fuse, compile) | at most 2-3 % of end-to-end, but 100 % of chunk latency | matters for real-robot deploy, not for LIBERO Time/Step |
+| `encode`/`prefill` reuse across chunks | 61 % of chunk latency -> chunk ~50 ms | long-term algorithmic work, changes the method |
+
+The practical conclusion for anyone comparing this port to the CUDA numbers: **report chunk
+latency (or chunk/10) side by side, and treat Time/Step as a simulator property of this
+harness.** The accuracy claim (98.6 % on three suites, see below) and the algorithmic
+speedup (4.32x) are the port-relevant results; the absolute Time/Step is not.
 
 ## Async overlap under a realistic env step
 
