@@ -1,0 +1,29 @@
+type: latency
+variant: baseline
+num_views: 2
+
+policy:
+  type: pi05
+  device: npu
+  dtype: bfloat16
+  # Official LeRobot pi0.5 LIBERO base checkpoint (un-finetuned: latency only).
+  pretrained_path: /home/data/flashvla/weights/pi05_libero_base
+  compile_model: false
+  fuse_qkv: true
+  fuse_gate_up: true
+  num_frames_per_view: 1
+  image_resolution: [224, 224]
+  # Paper App. A.1: "The model replans every 5 action steps."
+  n_action_steps: 5
+
+dataset:
+  repo_id: HuggingFaceVLA/libero
+  root: /home/data/flashvla/datasets/libero
+  streaming: false
+
+num_samples: 100
+warmup_steps: 10
+batch_size: 1
+num_workers: 0
+seed: 42
+output_file: outputs/benchmarks/npu_latency_base.json

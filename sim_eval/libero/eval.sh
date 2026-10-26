@@ -20,6 +20,10 @@ fi
 : "${N_EPISODES:=50}"
 : "${N_ACTION_STEPS:=10}"
 : "${GPUS:=1}"
+# POLICY_DEVICE: torch device the policy runs on. Non-CUDA backends (e.g.
+# Ascend NPU) set this to "npu" and pin the visible chips via
+# ASCEND_RT_VISIBLE_DEVICES instead of CUDA_VISIBLE_DEVICES (ignored there).
+: "${POLICY_DEVICE:=cuda}"
 # EPISODE_LENGTH: optional override for env.episode_length. Default unset
 # → uses lerobot's TASK_SUITE_MAX_STEPS (280/280/300/520 for spatial/object/
 # goal/10). Set e.g. EPISODE_LENGTH=500 to give every suite the same cap.
@@ -144,13 +148,20 @@ worker() {
       episode_length_arg=(--env.episode_length="$EPISODE_LENGTH")
     fi
 
-    CUDA_VISIBLE_DEVICES=$gpu python sim_eval/libero/eval.py \
+    # Chip selection. Upstream uses CUDA_VISIBLE_DEVICES; Ascend ignores that
+    # variable and reads ASCEND_RT_VISIBLE_DEVICES instead, so translate when
+    # the policy runs on NPU. The GPUS interface stays the same either way.
+    local dev_env=(CUDA_VISIBLE_DEVICES="$gpu")
+    if [ "$POLICY_DEVICE" = "npu" ]; then
+      dev_env=(ASCEND_RT_VISIBLE_DEVICES="$gpu")
+    fi
+    env "${dev_env[@]}" python sim_eval/libero/eval.py \
       --policy.path="$POLICY_PATH" \
       --policy.compile_model="$COMPILE_MODEL" \
       --policy.fuse_qkv="$FUSE" \
       --policy.fuse_gate_up="$FUSE" \
       --policy.n_action_steps="$N_ACTION_STEPS" \
-      --policy.device=cuda \
+      --policy.device="$POLICY_DEVICE" \
       --env.type=libero \
       --env.task="$suite" \
       "${episode_length_arg[@]}" \

@@ -37,6 +37,7 @@ from lerobot.utils.constants import OBS_PREFIX
 from benchmark_config import BenchmarkConfig
 
 import flashvla.configs  # noqa: F401 — registers PI05 configs with draccus
+import flashvla.npu_support  # noqa: F401 — registers the "npu" device backend
 
 logger = logging.getLogger(__name__)
 

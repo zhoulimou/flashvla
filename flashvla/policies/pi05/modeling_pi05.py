@@ -55,8 +55,26 @@ def _ev_elapsed_ms(start, end):
 
 
 @torch._dynamo.disable
+def _new_timing_event(device):
+    """Create a timing event on the backend that owns ``device``.
+
+    Upstream hard-coded ``torch.cuda.Event`` here, which raises
+    ``RuntimeError: Tried to instantiate dummy base class Event`` on a
+    CUDA-less build (e.g. Ascend NPU). Keep CUDA behaviour unchanged and
+    fall back to the NPU event class when the model lives on an NPU.
+    """
+    if getattr(device, "type", None) == "npu":
+        return torch.npu.Event(enable_timing=True)
+    return torch.cuda.Event(enable_timing=True)
+
+
+@torch._dynamo.disable
 def _cuda_sync():
-    torch.cuda.synchronize()
+    """Synchronise the accelerator that is actually present."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
 
 
 
@@ -964,7 +982,7 @@ class PI05Model(nn.Module):
         device = tokens.device
 
         _evs = (
-            [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            [_new_timing_event(device) for _ in range(4)]
             if profile
             else None
         )

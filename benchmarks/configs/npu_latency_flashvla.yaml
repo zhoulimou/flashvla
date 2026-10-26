@@ -1,0 +1,37 @@
+type: latency
+variant: flashvla
+num_views: 2
+
+policy:
+  type: pi05-flashvla
+  device: npu
+  dtype: bfloat16
+  # FlashVLA pi0.5 LIBERO checkpoint (chunk_size=10, num_buffer_slots=4).
+  pretrained_path: /home/data/flashvla/weights/flashvla-pi05-libero
+  compile_model: false
+  # fuse_qkv/fuse_gate_up MUST stay false for the FlashVLA decoder: its
+  # attention/MLP forwards have no qkv_proj / merged gate-up branch, so the
+  # fused modules installed at load time are never called and the deleted
+  # q_proj/k_proj/v_proj attributes cause a segfault. The pi0.5 path is fine
+  # because modeling_pi05.py does have those branches.
+  fuse_qkv: false
+  fuse_gate_up: false
+  num_frames_per_view: 1
+  image_resolution: [224, 224]
+  # Must match the checkpoint: chunk 10 / 4 buffer slots (paper Tab. 3 config).
+  chunk_size: 10
+  num_buffer_slots: 4
+  n_action_steps: 10
+  cold_start_mode: current_state
+
+dataset:
+  repo_id: HuggingFaceVLA/libero
+  root: /home/data/flashvla/datasets/libero
+  streaming: false
+
+num_samples: 100
+warmup_steps: 10
+batch_size: 1
+num_workers: 0
+seed: 42
+output_file: outputs/benchmarks/npu_latency_flashvla.json
