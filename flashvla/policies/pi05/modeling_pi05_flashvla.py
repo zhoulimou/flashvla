@@ -105,23 +105,33 @@ class PI05PrefixEmbedder(nn.Module):
         att_masks = []
         bsz = tokens.shape[0]
 
-        for img, img_mask in zip(images, img_masks, strict=True):
+        images = list(images)
+        img_masks = list(img_masks)
+        if len(images) != len(img_masks):
+            raise ValueError(f"got {len(images)} images but {len(img_masks)} img_masks")
+        if images:
+            if any(img.shape[0] != bsz for img in images):
+                raise ValueError(f"every view must share the token batch size {bsz}")
+            if len({tuple(img.shape[1:]) for img in images}) != 1:
+                raise ValueError("all views must share the same resolution and channels")
             pg = self._paligemma_model[0]
             vt = pg.vision_tower.vision_model
-            hidden = vt.embeddings(img)
             enc_dtype = getattr(
                 self,
                 "_fsdp_compute_dtype",
                 vt.encoder.layers[0].self_attn.q_proj.weight.dtype,
             )
-            hidden = hidden.to(enc_dtype)
+            # The ViT never attends across views and every view has the same
+            # resolution, so the views can share one batched ViT pass instead of
+            # one pass each. Same math, half the vision kernels, twice the GEMM M.
+            hidden = vt.embeddings(torch.cat(images, dim=0)).to(enc_dtype)
             hidden = vt.encoder(inputs_embeds=hidden).last_hidden_state
-            img_feats = vt.post_layernorm(hidden)
-            img_emb = pg.multi_modal_projector(img_feats)
-            bsz, num_img_embs = img_emb.shape[:2]
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
-            att_masks += [0] * num_img_embs
+            img_embs = pg.multi_modal_projector(vt.post_layernorm(hidden))
+            num_img_embs = img_embs.shape[1]
+            for idx, img_mask in enumerate(img_masks):
+                embs.append(img_embs[idx * bsz : (idx + 1) * bsz])
+                pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
+                att_masks += [0] * num_img_embs
 
         lang_emb = self._paligemma_model[0].language_model.embed_tokens(tokens)
         lang_emb_dim = lang_emb.shape[-1]
