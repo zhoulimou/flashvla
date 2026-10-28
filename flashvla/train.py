@@ -24,6 +24,12 @@ from pprint import pformat
 from typing import Any
 
 import torch
+
+# Register the "npu" backend with lerobot before any config is parsed; without
+# this, --policy.device=npu is rejected by lerobot's device whitelist. This is
+# the training-entry equivalent of the import in benchmark_latency.py.
+import flashvla.npu_support  # noqa: E402,F401
+
 import accelerate as accelerate_lib
 from accelerate import Accelerator
 from termcolor import colored
