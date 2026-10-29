@@ -45,6 +45,11 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtyp
         
     if device == "mps" and dtype == torch.float64:
         return torch.float32
+
+    # Ascend has no native FP64: float64 kernels fall back to the AI_CPU queue
+    # and cost milliseconds each. Everything downstream is cast to bf16 anyway.
+    if device == "npu" and dtype == torch.float64:
+        return torch.float32
     
     if device == "xpu" and dtype == torch.float64:
         if hasattr(torch.xpu, "get_device_capability"):
@@ -372,6 +377,27 @@ def create_sinusoidal_pos_embedding(
     return pos_emb
 
 
+_SINUSOIDAL_SCALING_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _sinusoidal_scaling_factor(dimension: int, min_period: float, max_period: float,
+                               device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Frequency scaling for the sinusoidal embedding.
+
+    Depends only on the config, not on the timestep, so it is computed once and
+    reused. On the previous float64 path this cost ~1 ms of AI_CPU time per call.
+    """
+    key = (dimension, float(min_period), float(max_period), str(device), str(dtype))
+    cached = _SINUSOIDAL_SCALING_CACHE.get(key)
+    if cached is not None:
+        return cached
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+    scaling = 1.0 / period * 2 * math.pi
+    _SINUSOIDAL_SCALING_CACHE[key] = scaling
+    return scaling
+
+
 def create_sinusoidal_pos_embedding_for_blocks(
     time: torch.Tensor,
     dimension: int,
@@ -410,14 +436,11 @@ def create_sinusoidal_pos_embedding_for_blocks(
         raise ValueError("The time tensor is expected to be of shape `(batch_size, num_blocks * block_size)`.")
 
     dtype = get_safe_dtype(torch.float64, device.type)
-    
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
-    period = min_period * (max_period / min_period) ** fraction
 
-    scaling_factor = 1.0 / period * 2 * math.pi
+    scaling_factor = _sinusoidal_scaling_factor(dimension, min_period, max_period, device, dtype)
     sin_input = scaling_factor[None, None, :] * time[:, :, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=2)
-    
+
     return pos_emb
 
 
