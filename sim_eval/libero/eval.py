@@ -351,6 +351,14 @@ def eval_policy(
         if episode_indices:
             lo = batch_ix * env.num_envs
             seeds = [start_seed + i for i in episode_indices[lo:lo + env.num_envs]]
+            # LIBERO picks its initial state from a file via a monotonically
+            # increasing counter (init_state_id), not from the seed. Override
+            # it so an explicit episode index really selects that init state.
+            for _i, _ep in enumerate(episode_indices[lo:lo + env.num_envs]):
+                try:
+                    env.envs[_i].init_state_id = _ep
+                except (AttributeError, IndexError):
+                    pass
         elif start_seed is None:
             seeds = None
         else:
