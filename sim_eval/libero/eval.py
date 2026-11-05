@@ -76,6 +76,10 @@ class AsyncEvalPipelineConfig(EvalPipelineConfig):
     CLI flag: ``--inference_overlap_steps 2`` (default 0 = sync).
     """
     inference_overlap_steps: int = 0
+    # Optional explicit episode subset (comma separated episode indices,
+    # relative to ``--seed``). Empty = upstream behaviour (first n episodes).
+    # Used by the RSI evaluation recipe (dev/holdout folds).
+    episode_indices: str = ""
 
 
 def get_safe_torch_device(device):
@@ -296,9 +300,14 @@ def eval_policy(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     only_record_failures: bool = False,
+    episode_indices: list[int] | None = None,
 ) -> dict:
     if max_episodes_rendered > 0 and not videos_dir:
         raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
+
+    # RSI recipe: run an explicit episode subset instead of the first n.
+    if episode_indices:
+        n_episodes = len(episode_indices)
 
     if not isinstance(policy, PreTrainedPolicy):
         raise ValueError(
@@ -339,7 +348,10 @@ def eval_policy(
         if max_episodes_rendered > 0:
             ep_frames: list[np.ndarray] = []
 
-        if start_seed is None:
+        if episode_indices:
+            lo = batch_ix * env.num_envs
+            seeds = [start_seed + i for i in episode_indices[lo:lo + env.num_envs]]
+        elif start_seed is None:
             seeds = None
         else:
             seeds = range(
@@ -523,6 +535,12 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
     set_seed(cfg.seed)
 
+    # RSI recipe: optional explicit episode subset (comma separated indices).
+    _episode_indices = (
+        [int(x) for x in cfg.episode_indices.split(",") if x.strip()]
+        if cfg.episode_indices.strip() else None
+    )
+
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
     logging.info(
         colored("Async overlap:", "yellow", attrs=["bold"])
@@ -599,6 +617,7 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             only_record_failures=os.environ.get("EVAL_RECORD_ALL", "0") in ("0", "false", "False"),
             output_dir=Path(cfg.output_dir),
+            episode_indices=_episode_indices,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -641,6 +660,7 @@ def eval_one(
     return_episode_data: bool,
     start_seed: int | None,
     only_record_failures: bool = False,
+    episode_indices: list[int] | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -660,6 +680,7 @@ def eval_one(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         only_record_failures=only_record_failures,
+        episode_indices=episode_indices,
     )
 
     per_episode = task_result["per_episode"]
@@ -690,6 +711,7 @@ def run_one(
     return_episode_data: bool,
     start_seed: int | None,
     only_record_failures: bool = False,
+    episode_indices: list[int] | None = None,
 ):
     task_videos_dir = None
     if videos_dir is not None:
@@ -710,6 +732,7 @@ def run_one(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         only_record_failures=only_record_failures,
+        episode_indices=episode_indices,
     )
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])
@@ -733,6 +756,7 @@ def eval_policy_all(
     max_parallel_tasks: int = 1,
     only_record_failures: bool = False,
     output_dir: Path | None = None,
+    episode_indices: list[int] | None = None,
 ) -> dict:
     start_t = time.time()
 
@@ -777,6 +801,7 @@ def eval_policy_all(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         only_record_failures=only_record_failures,
+        episode_indices=episode_indices,
     )
 
     def _dump_partial(tg: str, tid: int, metrics: dict, infos: list[dict]) -> None:

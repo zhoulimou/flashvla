@@ -71,6 +71,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"--seed={args.seed}",
         f'--output_dir="{out}"',
     ])
+    if args.episode_indices:
+        cli += f' --episode_indices="{args.episode_indices}"'
     script = (
         "set +u; source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null; set -u; "
         f"export ASCEND_RT_VISIBLE_DEVICES={args.chip}; "
@@ -189,6 +191,8 @@ def main() -> int:
     p.add_argument("--n_episodes", type=int, default=50)
     p.add_argument("--overlap", type=int, default=0)
     p.add_argument("--seed", type=int, default=1000)
+    p.add_argument("--episode-indices", dest="episode_indices", default="",
+                   help="comma separated episode indices (RSI recipe); empty = first n_episodes")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("merge")
