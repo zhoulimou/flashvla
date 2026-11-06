@@ -356,7 +356,10 @@ def eval_policy(
             # it so an explicit episode index really selects that init state.
             for _i, _ep in enumerate(episode_indices[lo:lo + env.num_envs]):
                 try:
-                    env.envs[_i].init_state_id = _ep
+                    # Match a sequential full run: warmup consumes one init
+                    # state and each batch advances the counter by two, so
+                    # episode i uses init_state 1 + 2*i (measured empirically).
+                    env.envs[_i].init_state_id = 1 + 2 * _ep
                 except (AttributeError, IndexError):
                     pass
         elif start_seed is None:
