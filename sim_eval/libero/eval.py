@@ -351,6 +351,11 @@ def eval_policy(
         if episode_indices:
             lo = batch_ix * env.num_envs
             seeds = [start_seed + i for i in episode_indices[lo:lo + env.num_envs]]
+            # Make each episode independent of run order: reset the global RNG
+            # from its index before the rollout, so any subset reproduces the
+            # same episode as a sequential run would.
+            if seeds:
+                set_seed(seeds[0])
             # LIBERO picks its initial state from a file via a monotonically
             # increasing counter (init_state_id), not from the seed. Override
             # it so an explicit episode index really selects that init state.

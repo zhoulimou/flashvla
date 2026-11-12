@@ -73,6 +73,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     ])
     if args.episode_indices:
         cli += f' --episode_indices="{args.episode_indices}"'
+    # Arbitrary policy overrides for RSI experiments, e.g.
+    # --policy-extra num_buffer_slots=3,chunk_size=10 -> --policy.num_buffer_slots=3 ...
+    if getattr(args, "policy_extra", ""):
+        for kv in args.policy_extra.split(","):
+            kv = kv.strip()
+            if kv:
+                cli += f" --policy.{kv}"
     script = (
         "set +u; source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null; set -u; "
         f"export ASCEND_RT_VISIBLE_DEVICES={args.chip}; "
@@ -193,6 +200,8 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=1000)
     p.add_argument("--episode-indices", dest="episode_indices", default="",
                    help="comma separated episode indices (RSI recipe); empty = first n_episodes")
+    p.add_argument("--policy-extra", dest="policy_extra", default="",
+                   help="comma separated key=value policy overrides, e.g. num_buffer_slots=3")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("merge")
