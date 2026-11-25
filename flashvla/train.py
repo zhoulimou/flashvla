@@ -15,6 +15,7 @@
 
 import gc
 import logging
+import os
 import shutil
 import sys
 import time
@@ -211,8 +212,6 @@ def _iter_streaming_time_mlp_modules(policy: PreTrainedPolicy):
                 yield f"model.suffix_embedder.{attribute}", module
 
     for attribute in (
-        "action_time_mlp_in",
-        "action_time_mlp_out",
         "time_mlp_in",
         "time_mlp_out",
     ):
@@ -555,6 +554,15 @@ def auto_resume(cfg: FlashVLATrainConfig) -> FlashVLATrainConfig:
             candidate_checkpoint_dir = last_checkpoint
 
         if candidate_checkpoint_dir is not None:
+            _pretrained = candidate_checkpoint_dir / "pretrained_model"
+            if (not (_pretrained / "model.safetensors").is_file()
+                    and (_pretrained / "adapter_model.safetensors").is_file()):
+                raise RuntimeError(
+                    f"Auto-resume found a LoRA adapter-only checkpoint at {_pretrained} "
+                    "(no model.safetensors). Refusing to resume: loading it as a full "
+                    "policy will fail. Move/rename the output_dir to start fresh, or merge "
+                    "the adapter into full weights first."
+                )
             cfg.resume = True
 
             train_config_json = candidate_checkpoint_dir / "pretrained_model" / "train_config.json"
@@ -778,6 +786,37 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     apply_flashvla_training_init(policy, cfg, is_main_process=is_main_process)
 
+    # ---- optional LoRA (paper Appendix C.6: VLM rank 32, action head rank 16) ----
+    _lora_vlm = int(os.environ.get("LORA_R_VLM", "0"))
+    _lora_act = int(os.environ.get("LORA_R_ACT", "0"))
+    if _lora_vlm > 0 or _lora_act > 0:
+        from peft import LoraConfig, get_peft_model
+        _vlm_pat = r"model\.layers\.\d+\.self_attn\.vlm_attention\.(q|v)_proj"
+        _act_pat = r"model\.layers\.\d+\.self_attn\.action_expert_attention\.(q|v)_proj"
+        _proj_pat = r"model\.(suffix_embedder\.)?(action_(in|out)_proj|time_mlp_(in|out))"
+        _pats, _rank, _alpha = [], {}, {}
+        if _lora_vlm > 0:
+            _pats.append(_vlm_pat); _rank[_vlm_pat] = _lora_vlm; _alpha[_vlm_pat] = 2 * _lora_vlm
+        if _lora_act > 0:
+            for _p in (_act_pat, _proj_pat):
+                _pats.append(_p); _rank[_p] = _lora_act; _alpha[_p] = 2 * _lora_act
+        policy = get_peft_model(policy, LoraConfig(
+            r=_lora_act or _lora_vlm,
+            lora_alpha=2 * (_lora_act or _lora_vlm),
+            target_modules="|".join(_pats),
+            rank_pattern=_rank,
+            alpha_pattern=_alpha,
+            lora_dropout=0.05,
+            bias="none",
+        ))
+        if is_main_process:
+            _tr = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+            _all = sum(p.numel() for p in policy.parameters())
+            logging.info(
+                f"LoRA enabled: VLM r={_lora_vlm}, action r={_lora_act}, "
+                f"trainable={_tr:,} ({100.0 * _tr / max(_all, 1):.2f}% of {_all:,})"
+            )
+
     if getattr(cfg.policy, "freeze_vision_encoder", False):
         if hasattr(policy.model, "vlm") and hasattr(policy.model.vlm, "model") and hasattr(policy.model.vlm.model, "vision_tower"):
             vision_tower = policy.model.vlm.model.vision_tower
@@ -816,15 +855,25 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating preprocessor and postprocessor")
+    _keep_norm = os.environ.get("KEEP_PRETRAINED_NORM") == "1"
+    if _keep_norm and is_main_process:
+        logging.info("KEEP_PRETRAINED_NORM=1: reusing the checkpoint's normalizer stats")
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
-        dataset_stats=dataset.meta.stats,
+        dataset_stats=None if _keep_norm else dataset.meta.stats,
     )
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
-    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    if _lora_vlm > 0 or _lora_act > 0:
+        _trainable = [p for p in policy.parameters() if p.requires_grad]
+        if not _trainable:
+            raise RuntimeError("LoRA enabled but no trainable parameters were found")
+        optimizer = cfg.optimizer.build(_trainable)
+        lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps) if cfg.scheduler is not None else None
+    else:
+        optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
     step = 0
 
